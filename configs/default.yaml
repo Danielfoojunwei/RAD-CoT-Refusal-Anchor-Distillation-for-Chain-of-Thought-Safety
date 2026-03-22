@@ -1,0 +1,49 @@
+# RAD-CoT Default Configuration
+
+model:
+  name: "Qwen/Qwen3-14B"
+  dtype: "bfloat16"
+  device_map: "auto"
+
+# Phase 1: DMS Circuit Identification
+dms:
+  # Calibration dataset sizes
+  n_refuse: 500
+  n_comply: 500
+  n_benign: 500
+  # Activation patching
+  n_patching_prompts: 100
+  # Circuit selection
+  dms_mass_threshold: 0.90  # cover 90% of DMS mass
+  # Threshold calibration
+  delta_fraction: 0.80  # delta = 0.80 * min(norms over D_refuse)
+
+# Phase 2: Soft Steering
+steering:
+  alpha: 0.3  # primary steering strength
+  alpha_sweep: [0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+
+# CoT-Hijacking attack parameters
+attack:
+  min_padding_tokens: 100
+  max_padding_tokens: 500
+  min_cot_length: 200
+
+# Evaluation
+eval:
+  judge_model: "gpt-4o"
+  n_attack_attempts: 100
+  gsm8k_shots: 8
+  math_shots: 4
+  humaneval_samples: 10
+
+# Experiment tracking
+wandb:
+  project: "rad-cot"
+  entity: null
+
+# Compute
+compute:
+  seed: 42
+  max_seq_len: 4096
+  batch_size: 4
