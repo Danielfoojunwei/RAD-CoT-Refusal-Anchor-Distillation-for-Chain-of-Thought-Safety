@@ -14,6 +14,8 @@ logger = setup_logger(__name__)
 SUPPORTED_MODELS = {
     "Qwen/Qwen3-14B": {"n_layers": 40, "n_heads": 40, "d_head": 128},
     "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B": {"n_layers": 28, "n_heads": 28, "d_head": 128},
+    "Qwen/Qwen2.5-0.5B-Instruct": {"n_layers": 24, "n_heads": 14, "d_head": 64},
+    "Qwen/Qwen2.5-1.5B-Instruct": {"n_layers": 28, "n_heads": 12, "d_head": 128},
 }
 
 
@@ -34,11 +36,16 @@ def load_model_and_tokenizer(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    load_kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+    }
+    if config.device_map is not None:
+        load_kwargs["device_map"] = config.device_map
+
     model = AutoModelForCausalLM.from_pretrained(
         config.name,
-        torch_dtype=dtype,
-        device_map=config.device_map,
-        trust_remote_code=True,
+        **load_kwargs,
     )
     model.eval()
 
