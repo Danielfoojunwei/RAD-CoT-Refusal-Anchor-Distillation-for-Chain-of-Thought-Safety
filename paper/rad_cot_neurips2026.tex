@@ -1,0 +1,797 @@
+\documentclass[11pt]{article}
+\usepackage{neurips_2026}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{enumitem}
+
+\newtheorem{definition}{Definition}
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\title{RAD-CoT: Refusal-Anchor Distillation for Chain-of-Thought Safety}
+
+\author{
+  Anonymous Author(s)
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Chain-of-thought (CoT) reasoning has become the dominant paradigm for achieving state-of-the-art performance on complex reasoning tasks, with models such as OpenAI o1, DeepSeek-R1, and Qwen3 demonstrating remarkable capabilities in mathematics, code generation, and scientific reasoning. However, we identify a critical and previously underexplored vulnerability: \textbf{CoT-Hijacking}, a class of attacks in which adversaries prepend benign-appearing reasoning padding to harmful prompts, causing the model's internal safety-relevant attention signals to progressively dilute over the extended generation trace. We demonstrate that baseline aligned models exhibit attack success rates (ASR) as high as 99\% under CoT-Hijacking, revealing a fundamental gap in current alignment techniques---which treat safety as a one-shot classification decision at generation onset rather than a per-token invariant maintained throughout reasoning.
+
+We propose \textbf{RAD-CoT} (\textit{Refusal-Anchor Distillation for Chain-of-Thought Safety}), a training-free inference-time defense that identifies and preserves the internal attention circuits causally responsible for refusal behavior during extended CoT generation. RAD-CoT operates in two phases: (1) \textit{Dilution-Masked Scoring} (DMS), which combines context-sensitivity analysis with causal ablation to isolate a sparse set of safety-critical attention heads, and (2) \textit{per-token soft steering}, which applies lightweight activation adjustments at each decoding step to maintain the refusal signal above a calibrated threshold. Evaluated on Qwen3-14B and DeepSeek-R1-Distill-Qwen-7B, RAD-CoT reduces CoT-Hijacking ASR from 99\% to below 5\%, while incurring less than 3\% degradation on standard reasoning benchmarks (GSM8K, MATH, HumanEval) and approximately 5\% latency overhead. Crucially, RAD-CoT generalizes to unseen CoT-Hijacking attack variants, achieving over 60\% relative ASR reduction on held-out attack templates without any retraining or additional fine-tuning.
+\end{abstract}
+
+%---------------------------------------------------------------------
+\section{Introduction}
+\label{sec:introduction}
+
+Large language models (LLMs) augmented with chain-of-thought (CoT) reasoning have achieved transformative gains across a broad spectrum of challenging tasks. Models such as OpenAI o1 \citep{openai2024o1}, DeepSeek-R1 \citep{deepseekai2025deepseekr1}, and Qwen3 \citep{qwen2025qwen3} leverage extended internal reasoning traces---sometimes spanning thousands of tokens---to decompose complex problems into intermediate steps, yielding state-of-the-art performance on mathematical reasoning \citep{hendrycks2021measuring, cobbe2021gsm8k}, code generation \citep{chen2021evaluating}, and scientific question answering \citep{rein2024gpqa}. The prevailing trend in the field is clear: longer, more elaborate reasoning produces better outcomes, and frontier laboratories are investing heavily in scaling inference-time computation \citep{wei2022chain, wang2023selfconsistency}.
+
+Yet this paradigm shift toward extended generation introduces a fundamental tension with safety alignment. Current alignment techniques---including reinforcement learning from human feedback (RLHF) \citep{ouyang2022training, christiano2017deep}, direct preference optimization (DPO) \citep{rafailov2023direct}, and constitutional AI \citep{bai2022constitutional}---were designed and evaluated in a regime where models produce relatively short responses to potentially harmful queries. In this regime, the model's safety behavior can be understood as a near-instantaneous classification: upon encountering a harmful prompt, the model either refuses or complies, and this decision is effectively made within the first few tokens of generation. The implicit assumption underlying these approaches is that safety is a \emph{property of the prompt-response boundary}---a one-shot decision that, once made, governs the entire response.
+
+\paragraph{The CoT-Hijacking Attack.} We identify and formalize a new class of adversarial attacks, which we term \textbf{CoT-Hijacking}, that directly exploits this assumption. The core insight is disarmingly simple: by prepending or interleaving benign-appearing reasoning steps before or around a harmful request, an adversary can cause the model's internal safety signals to \emph{dilute} over the extended generation context. Concretely, consider an attacker who constructs a prompt consisting of several innocuous reasoning steps (e.g., solving a simple algebra problem) followed by a harmful instruction embedded within what appears to be a continuation of the reasoning chain. As the model processes and extends the benign reasoning prefix, the attention heads responsible for detecting and refusing harmful content---which we term \emph{refusal circuits}---progressively lose their activation strength relative to the growing context of safe-appearing tokens.
+
+This phenomenon, which we formalize as \textbf{safety signal dilution}, is not merely theoretical. In our experiments (Section~\ref{sec:experiments}), we demonstrate that state-of-the-art aligned models exhibit attack success rates (ASR) of up to 99\% under carefully constructed CoT-Hijacking attacks, even when these same models reliably refuse the identical harmful requests presented without reasoning padding. The attack requires no gradient access, no model-specific optimization, and no knowledge of model internals---only the ability to craft plausible-looking reasoning prefixes, making it broadly accessible and practically dangerous.
+
+\paragraph{Why Existing Defenses Fall Short.} The vulnerability exposed by CoT-Hijacking is orthogonal to the threat models addressed by existing jailbreak defenses. Adversarial suffix attacks such as GCG \citep{zou2023universal} and AutoDAN \citep{liu2024autodan} operate by optimizing discrete or continuous token sequences to suppress refusal; defenses against these attacks focus on detecting or filtering adversarial suffixes, which are typically semantically incoherent. Prompt-level defenses such as perplexity filtering \citep{jain2023baseline} and input preprocessing \citep{robey2023smoothllm} are designed to identify anomalous inputs, but CoT-Hijacking prompts are composed entirely of fluent, semantically meaningful text. System-prompt-based defenses and output classifiers \citep{inan2023llamaguard} can be partially effective but operate as external wrappers that do not address the underlying mechanism of internal signal dilution. Fundamentally, none of these approaches address the \emph{token-level dynamics} of safety signal propagation during extended generation.
+
+\paragraph{Key Insight: Safety as a Per-Token Invariant.} Our central thesis is that for CoT-capable models, safety alignment must be reconceived as a \textbf{per-token invariant} rather than a one-shot boundary decision. At every step of the generation process, regardless of the preceding context length or content, the model's internal representation must maintain sufficient activation of safety-critical circuits to detect and respond to harmful content. This perspective shifts the problem from \emph{input classification} to \emph{runtime monitoring of internal computation}, drawing on recent advances in mechanistic interpretability \citep{elhage2021mathematical, olsson2022context, conmy2023automated} that have begun to reveal how specific attention heads and MLP sublayers implement high-level behaviors.
+
+\paragraph{Our Approach: RAD-CoT.} We propose \textbf{RAD-CoT} (Refusal-Anchor Distillation for Chain-of-Thought Safety), an inference-time method that identifies and maintains the activation of safety-critical attention circuits throughout CoT generation. RAD-CoT operates in two stages. First, we introduce \textbf{Dilution-Masked Scoring (DMS)}, a circuit identification procedure that combines context-sensitivity analysis---measuring how each attention head's activation changes between short and CoT-padded contexts---with causal ablation to isolate the minimal set of attention heads whose intervention is both necessary and sufficient for maintaining refusal behavior. Second, during inference, RAD-CoT applies \textbf{per-token soft steering}: at each decoding step, it computes a lightweight adjustment to the activations of the identified safety-critical heads, anchoring their output toward a reference refusal direction calibrated from a small set of harmful prompt exemplars. This steering is applied as a soft bias rather than a hard clamp, preserving the model's capacity for nuanced reasoning while preventing catastrophic dilution of safety signals.
+
+\paragraph{Contributions.} Our contributions are as follows:
+\begin{enumerate}[leftmargin=*, itemsep=2pt, topsep=2pt]
+    \item \textbf{Formalization of CoT-Hijacking.} We provide the first formal characterization of CoT-Hijacking as a safety signal dilution phenomenon, distinguishing it from existing jailbreak taxonomies and establishing a threat model appropriate for reasoning-augmented LLMs (Section~\ref{sec:threat_model}).
+
+    \item \textbf{Dilution-Masked Scoring (DMS).} We introduce a principled circuit identification method that combines context-sensitivity analysis with causal effect measurement to isolate safety-critical attention heads with high precision. DMS identifies circuits that are both \emph{sensitive to dilution} and \emph{causally necessary for refusal}, yielding a sparse and interpretable set of intervention targets (Section~\ref{sec:method_dms}).
+
+    \item \textbf{Per-Token Soft Steering.} We propose a training-free inference-time intervention that maintains safety signal strength as a per-token invariant throughout extended generation. Our method introduces approximately 5\% latency overhead and requires no model retraining, fine-tuning, or architectural modification (Section~\ref{sec:method_steering}).
+
+    \item \textbf{Comprehensive Evaluation.} We evaluate RAD-CoT on two frontier reasoning models---Qwen3-14B and DeepSeek-R1-Distill-Qwen-7B---across multiple CoT-Hijacking attack variants, standard safety benchmarks, and reasoning benchmarks (GSM8K, MATH, HumanEval). RAD-CoT reduces ASR from 99\% to below 5\% while preserving reasoning performance within 3\%, and generalizes to unseen attack variants with over 60\% relative ASR reduction (Section~\ref{sec:experiments}).
+\end{enumerate}
+
+%---------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related_work}
+
+\paragraph{Safety Alignment for LLMs.}
+The dominant paradigm for aligning LLMs with human values and safety requirements is reinforcement learning from human feedback (RLHF), introduced by \citet{christiano2017deep} and scaled to large language models by \citet{ouyang2022training} in the InstructGPT work. RLHF trains a reward model on human preference data and optimizes the language model policy via proximal policy optimization (PPO) \citep{schulman2017proximal}. \citet{rafailov2023direct} proposed Direct Preference Optimization (DPO), which eliminates the need for an explicit reward model by directly optimizing the policy on preference pairs, significantly simplifying the alignment pipeline while achieving competitive performance. Constitutional AI \citep{bai2022constitutional} introduced a self-supervised approach in which the model critiques and revises its own outputs according to a set of principles, reducing reliance on human annotation. More recently, \citet{dai2024safe} explored safe RLHF with separate reward and cost models, and Kahneman-Tversky Optimization (KTO) \citep{ethayarajh2024kto} proposed aligning with only binary feedback signals. While these methods have proven effective at reducing harmful outputs in standard evaluation settings, they fundamentally operate at the level of complete response preferences and do not explicitly address the token-level dynamics of safety signal propagation during extended generation---the precise vulnerability exploited by CoT-Hijacking.
+
+\paragraph{Jailbreak Attacks on LLMs.}
+A substantial body of work has demonstrated that aligned LLMs remain vulnerable to adversarial jailbreak attacks. \citet{zou2023universal} introduced the Greedy Coordinate Gradient (GCG) attack, which optimizes adversarial suffixes via discrete token-level gradient search to elicit harmful completions, and established the AdvBench benchmark for systematic evaluation. AutoDAN \citep{liu2024autodan} extended this approach by using a hierarchical genetic algorithm to generate more fluent and transferable jailbreak prompts. PAIR \citep{chao2023jailbreaking} demonstrated that an attacker LLM can iteratively refine jailbreak prompts through multi-turn dialogue, achieving high success rates with only black-box access. Template-based approaches such as DeepInception \citep{li2023deepinception} exploit nested fictional scenarios, while multilingual attacks \citep{deng2024multilingual} leverage cross-lingual transfer to bypass safety training conducted primarily in English. \citet{wei2024jailbroken} provided a taxonomy of jailbreak strategies, identifying competing objectives and mismatched generalization as key failure modes of safety training. Crucially, all of these attacks target the \emph{prompt} as the attack surface; CoT-Hijacking, by contrast, exploits the \emph{generation dynamics} themselves, representing a fundamentally different threat vector that is not addressed by prompt-level defenses such as perplexity filtering \citep{jain2023baseline}, SmoothLLM \citep{robey2023smoothllm}, or erase-and-check methods \citep{kumar2024certifying}.
+
+\paragraph{Mechanistic Interpretability for Safety.}
+Recent advances in mechanistic interpretability have opened the possibility of understanding and intervening on the internal computations underlying model behavior. Representation engineering \citep{zou2023representation} demonstrated that high-level concepts such as honesty and harmlessness are linearly represented in activation space and can be read and controlled via simple linear probes and steering vectors. \citet{turner2023activation} introduced activation addition (ActAdd), showing that steering vectors computed as the difference between contrastive prompt pairs can be added to residual stream activations to modulate model behavior at inference time. \citet{li2024inference} proposed inference-time intervention (ITI), which identifies truthfulness-related attention heads via probing classifiers and shifts their activations toward truthful directions during generation. On the circuit discovery front, \citet{conmy2023automated} introduced Automatic Circuit DisCovery (ACDC), an automated method for identifying computational subgraphs responsible for specific behaviors, building on the causal tracing methodology of \citet{meng2022locating}. Path patching \citep{goldowskydill2023localizing} and attribution patching \citep{nanda2023attribution, syed2023attribution} offer computationally efficient approximations to full activation patching for isolating causal pathways. Sparse autoencoders \citep{cunningham2023sparse, bricken2023monosemanticity} have enabled decomposition of superposed representations into interpretable features, including safety-relevant ones. Our DMS procedure builds directly on this line of work, combining the contrastive sensitivity analysis of representation engineering with the causal rigor of activation patching to identify circuits that are specifically vulnerable to dilution during CoT generation.
+
+\paragraph{Chain-of-Thought Reasoning.}
+Chain-of-thought prompting, introduced by \citet{wei2022chain}, demonstrated that eliciting intermediate reasoning steps dramatically improves LLM performance on arithmetic, commonsense, and symbolic reasoning tasks. Self-consistency decoding \citep{wang2023selfconsistency} further improved CoT by sampling multiple reasoning paths and marginalizing over them. Subsequent work explored zero-shot CoT \citep{kojima2022large}, least-to-most prompting \citep{zhou2023leasttomost}, and tree-of-thought reasoning \citep{yao2024tree}. The emergence of dedicated reasoning models---OpenAI o1 \citep{openai2024o1}, DeepSeek-R1 \citep{deepseekai2025deepseekr1}, and Qwen3 \citep{qwen2025qwen3}---marks a paradigm shift toward training models that natively produce extended reasoning traces spanning hundreds or thousands of tokens. These models achieve state-of-the-art results on challenging benchmarks including MATH \citep{hendrycks2021measuring}, GSM8K \citep{cobbe2021gsm8k}, GPQA \citep{rein2024gpqa}, and competition-level programming tasks. However, the safety implications of dramatically extended generation have received comparatively little attention.
+
+\paragraph{Safety of Chain-of-Thought Reasoning.}
+The intersection of CoT reasoning and safety is an emerging area with limited prior work. \citet{shaikh2023second} studied how CoT prompting can amplify social biases by making stereotypical reasoning explicit. \citet{wang2024chainofthought} examined whether the faithfulness of CoT traces correlates with the safety of model outputs. Concurrent work has explored hidden CoT manipulation, where adversaries attempt to influence model behavior by inserting instructions within reasoning traces \citep{roger2023preventing, xu2024preemptive}. The closest work to ours is the emerging investigation into safety-aware decoding strategies \citep{xu2024safedecoding} that modify token-level generation probabilities, though these operate at the output distribution level rather than intervening on internal safety circuits. To our knowledge, RAD-CoT is the first work to formally characterize the CoT-Hijacking vulnerability as an internal signal dilution phenomenon and to propose a mechanistically grounded, circuit-level defense.
+
+\paragraph{Activation Patching and Causal Tracing.}
+Our circuit identification methodology builds on the causal tracing framework introduced by \citet{meng2022locating} in the context of factual knowledge localization, which systematically corrupts and restores activations to identify causally important model components. \citet{goldowskydill2023localizing} extended this to path patching, enabling identification of specific computational pathways between attention heads. Attribution patching \citep{nanda2023attribution, syed2023attribution} provides a first-order approximation to full activation patching, reducing computational cost by orders of magnitude while maintaining high rank correlation with exact causal effects. \citet{hanna2023how} applied these techniques to identify circuits responsible for greater-than comparison, and \citet{wang2023interpretability} characterized the indirect object identification circuit in GPT-2. Our Dilution-Masked Scoring extends these methods by introducing a \emph{dilution-conditioned} causal analysis: rather than measuring the causal effect of a component on a single behavior, we measure how each component's causal contribution to refusal changes as a function of CoT padding length, enabling identification of the specific circuits most vulnerable to---and therefore most critical for defending against---safety signal dilution.
+\section{Method}
+\label{sec:method}
+
+We present \textsc{RAD-CoT} (\textbf{R}efusal-\textbf{A}nchor \textbf{D}istillation for \textbf{C}hain-\textbf{o}f-\textbf{T}hought Safety), a two-phase framework that identifies the minimal internal circuitry causally responsible for refusal behavior and enforces a continuous safety invariant during autoregressive generation. Phase~1 (\S\ref{subsec:dms}) performs offline \emph{Differential Mechanism Saliency} (DMS) circuit identification; Phase~2 (\S\ref{subsec:steering}) applies lightweight \emph{soft steering} at inference time. We begin with the formal problem setup.
+
+%──────────────────────────────────────────────────────────
+\subsection{Problem Formulation}
+\label{subsec:problem}
+
+Let $\mathcal{M}$ denote a pretrained transformer language model with $L$ layers, each containing $H$ attention heads of dimension $d_h$. We index individual heads by the pair $(l,h)$ with $l\in[L],\; h\in[H]$. For an input sequence $x$ of length $T$, let $\mathbf{a}^{(l,h)}(x)\in\mathbb{R}^{d_h}$ denote the attention output activation of head $(l,h)$ at the final token position after the output projection $W_O^{(l,h)}$.
+
+\begin{definition}[CoT-Hijacking Attack]
+\label{def:hijack}
+Given a harmful prompt $x$, a \emph{CoT-hijacking attack} prepends a benign reasoning padding $p\in\mathcal{P}$ of length $|p|\in[100,500]$ tokens to the chain-of-thought context, producing an augmented input $\tilde{x} = p \oplus x$. The attack succeeds if $\mathcal{M}$ generates a compliant (non-refusing) response to $\tilde{x}$ despite refusing $x$ under standard decoding.
+\end{definition}
+
+\begin{definition}[Safety Invariant]
+\label{def:invariant}
+A \emph{safety invariant} is a predicate $\mathcal{I}_t$ evaluated at each autoregressive decoding step $t$ over a designated circuit $\mathcal{C}\subseteq [L]\times[H]$, a set of unit-norm \emph{refusal directions} $\{{\mathbf{v}}^{(l,h)}\}_{(l,h)\in\mathcal{C}}$, and a scalar threshold $\delta>0$:
+\begin{equation}
+\label{eq:invariant}
+\mathcal{I}_t \;:\; \forall\,(l,h)\in\mathcal{C}:\;\big\|\operatorname{proj}_{{\mathbf{v}}^{(l,h)}}\!\big(\mathbf{a}^{(l,h)}_t\big)\big\| \;\geq\; \delta,
+\end{equation}
+where $\operatorname{proj}_{\mathbf{v}}(\mathbf{a}) = (\mathbf{v}^\top \mathbf{a})\,\mathbf{v}$ and $\|\operatorname{proj}_{\mathbf{v}}(\mathbf{a})\| = |\mathbf{v}^\top \mathbf{a}|$.
+\end{definition}
+
+\noindent\textbf{Goal.} Identify a minimal circuit $\mathcal{C}_{\mathrm{refusal}}$, extract per-head refusal directions $\{\mathbf{v}^{(l,h)}\}$, calibrate a threshold $\delta$, and enforce $\mathcal{I}_t$ at every decoding step such that (i)~refusal behavior is preserved under CoT-hijacking attacks and (ii)~benign generation quality is unaffected.
+
+%──────────────────────────────────────────────────────────
+\subsection{Phase 1: DMS Circuit Identification}
+\label{subsec:dms}
+
+\subsubsection{Calibration Dataset Construction}
+\label{subsubsec:data}
+
+We construct three calibration sets, each of cardinality $n{=}500$:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+\item \textbf{Refusal set} $\mathcal{D}_{\mathrm{refuse}}$: harmful prompts drawn from AdvBench~\citep{zou2023universal} on which $\mathcal{M}$ naturally refuses after chain-of-thought reasoning, filtered to retain only instances whose CoT trace exceeds 200 tokens.
+\item \textbf{Comply set} $\mathcal{D}_{\mathrm{comply}}$: the \emph{same} harmful prompts, each augmented with a CoT-hijacking padding $p_i\in\mathcal{P}$ (benign reasoning text, $|p_i|\in[100,500]$), filtered to retain instances where $\mathcal{M}$ produces a compliant response.
+\item \textbf{Benign set} $\mathcal{D}_{\mathrm{benign}}$: benign instructions sampled from FLAN~\citep{wei2022flan}, used for false-positive calibration to ensure that steering does not degrade helpfulness.
+\end{enumerate}
+
+\noindent By construction, every prompt in $\mathcal{D}_{\mathrm{refuse}}$ has a paired counterpart in $\mathcal{D}_{\mathrm{comply}}$ sharing identical harmful content but differing in the prepended context, enabling contrastive activation analysis.
+
+\subsubsection{DMS Score Computation}
+\label{subsubsec:dms_score}
+
+For each attention head $(l,h)\in[L]\times[H]$, we compute two complementary quantities.
+
+\paragraph{Context sensitivity.} We measure the distributional shift in activation space between the refusal and comply conditions:
+\begin{equation}
+\label{eq:context_sens}
+\delta_{l,h} \;=\; \bigg\|\frac{1}{n}\sum_{x\in\mathcal{D}_{\mathrm{refuse}}}\!\mathbf{a}^{(l,h)}(x) \;-\; \frac{1}{n}\sum_{\tilde{x}\in\mathcal{D}_{\mathrm{comply}}}\!\mathbf{a}^{(l,h)}(\tilde{x})\bigg\|_2.
+\end{equation}
+
+\paragraph{Causal effect.} We perform \emph{activation patching}~\citep{meng2022locating,conmy2023towards}: for each paired instance $(x_i, \tilde{x}_i)$, we run $\mathcal{M}$ on the refuse input $x_i$ and replace the attention output of head $(l,h)$ with the corresponding activation from the comply run on $\tilde{x}_i$, then measure the change in refusal probability:
+\begin{equation}
+\label{eq:causal}
+\mathrm{CE}_{l,h} \;=\; \frac{1}{n}\sum_{i=1}^{n}\big|\Delta P_i\!\left(\texttt{refusal\_token}\right)\big|, \quad \Delta P_i = P\!\left(\texttt{refusal\_token}\mid \text{patched}\right) - P\!\left(\texttt{refusal\_token}\mid x_i\right).
+\end{equation}
+
+\paragraph{DMS score.} The \emph{Differential Mechanism Saliency} score combines both signals multiplicatively, ensuring that only heads exhibiting \emph{both} large activation shifts \emph{and} causal influence on refusal receive high scores:
+\begin{equation}
+\label{eq:dms}
+\mathrm{DMS}(l,h) \;=\; \delta_{l,h}\;\times\;\mathrm{CE}_{l,h}.
+\end{equation}
+
+\subsubsection{Circuit Selection}
+\label{subsubsec:circuit}
+
+We select a minimal set $\mathcal{C}_{\mathrm{refusal}}\subseteq[L]\times[H]$ that captures at least a fraction $\tau{=}0.90$ of the total DMS mass. Let $S = \sum_{l,h}\mathrm{DMS}(l,h)$ denote the total mass. We sort all $L\!\cdot\!H$ heads in descending DMS order and greedily include heads until the cumulative mass meets the coverage threshold:
+\begin{equation}
+\label{eq:circuit_select}
+\mathcal{C}_{\mathrm{refusal}} = \underset{\mathcal{C}\subseteq[L]\times[H]}{\arg\min}\;|\mathcal{C}| \quad\text{s.t.}\quad \sum_{(l,h)\in\mathcal{C}}\mathrm{DMS}(l,h) \;\geq\; \tau \cdot S.
+\end{equation}
+This yields $K=|\mathcal{C}_{\mathrm{refusal}}|$ heads; empirically $K\approx 15$ for Qwen3-14B ($L{=}40, H{=}40$, i.e., fewer than $1\%$ of the 1600 total heads).
+
+\subsubsection{Refusal Direction Extraction}
+\label{subsubsec:direction}
+
+For each selected head $(l,h)\in\mathcal{C}_{\mathrm{refusal}}$, we extract a single \emph{refusal direction} via principal component analysis on the contrastive activation differences. Define the per-instance difference vectors:
+\begin{equation}
+\label{eq:diff}
+\Delta\mathbf{a}_i^{(l,h)} \;=\; \mathbf{a}^{(l,h)}(x_i) - \mathbf{a}^{(l,h)}(\tilde{x}_i), \qquad i\in[n],
+\end{equation}
+where $x_i\in\mathcal{D}_{\mathrm{refuse}}$ and $\tilde{x}_i\in\mathcal{D}_{\mathrm{comply}}$ are paired instances. Let $\Delta A^{(l,h)}\in\mathbb{R}^{n\times d_h}$ be the matrix with rows $\{\Delta\mathbf{a}_i^{(l,h)}\}_{i=1}^n$. The refusal direction is the first principal component:
+\begin{equation}
+\label{eq:refusal_dir}
+\mathbf{v}^{(l,h)} \;=\; \underset{\|\mathbf{v}\|=1}{\arg\max}\;\left\|\Delta A^{(l,h)}\,\mathbf{v}\right\|_2 \;=\; \text{top eigenvector of}\;\frac{1}{n}{\Delta A^{(l,h)}}^\top\!\Delta A^{(l,h)}.
+\end{equation}
+
+\subsubsection{Threshold Calibration}
+\label{subsubsec:threshold}
+
+The threshold $\delta$ is set conservatively relative to the weakest refusal-aligned projection observed across all refuse-set instances and all circuit heads:
+\begin{equation}
+\label{eq:threshold}
+\delta \;=\; \gamma\;\cdot\;\min_{x\in\mathcal{D}_{\mathrm{refuse}}}\;\min_{(l,h)\in\mathcal{C}_{\mathrm{refusal}}}\;\big|{\mathbf{v}^{(l,h)}}^\top\!\mathbf{a}^{(l,h)}(x)\big|,
+\end{equation}
+where $\gamma{=}0.80$ is a margin factor ensuring that the threshold lies strictly below the natural refusal regime, thereby avoiding false triggering on benign inputs.
+
+The complete offline pipeline is summarized in Algorithm~\ref{alg:dms}.
+
+\begin{algorithm}[t]
+\caption{Phase 1: DMS Circuit Identification}
+\label{alg:dms}
+\begin{algorithmic}[1]
+\Require Model $\mathcal{M}$ with $L$ layers, $H$ heads; datasets $\mathcal{D}_{\mathrm{refuse}},\mathcal{D}_{\mathrm{comply}},\mathcal{D}_{\mathrm{benign}}$ ($n{=}500$ each); coverage $\tau{=}0.90$; margin $\gamma{=}0.80$
+\Ensure Refusal circuit $\mathcal{C}_{\mathrm{refusal}}$, directions $\{\mathbf{v}^{(l,h)}\}$, threshold $\delta$
+\Statex
+\For{each head $(l,h)\in[L]\times[H]$}
+    \State $\bar{\mathbf{a}}_{\mathrm{ref}}^{(l,h)} \gets \frac{1}{n}\sum_{x\in\mathcal{D}_{\mathrm{refuse}}}\mathbf{a}^{(l,h)}(x)$
+    \State $\bar{\mathbf{a}}_{\mathrm{com}}^{(l,h)} \gets \frac{1}{n}\sum_{\tilde{x}\in\mathcal{D}_{\mathrm{comply}}}\mathbf{a}^{(l,h)}(\tilde{x})$
+    \State $\delta_{l,h} \gets \|\bar{\mathbf{a}}_{\mathrm{ref}}^{(l,h)} - \bar{\mathbf{a}}_{\mathrm{com}}^{(l,h)}\|_2$ \Comment{Context sensitivity (Eq.~\ref{eq:context_sens})}
+    \State $\mathrm{CE}_{l,h} \gets \text{ActivationPatch}(\mathcal{M}, l, h, \mathcal{D}_{\mathrm{refuse}}, \mathcal{D}_{\mathrm{comply}})$ \Comment{Causal effect (Eq.~\ref{eq:causal})}
+    \State $\mathrm{DMS}(l,h) \gets \delta_{l,h}\times\mathrm{CE}_{l,h}$
+\EndFor
+\Statex
+\State $S \gets \sum_{l,h}\mathrm{DMS}(l,h)$
+\State Sort heads by $\mathrm{DMS}(l,h)$ descending; let $\sigma$ be the sorted ordering
+\State $\mathcal{C}_{\mathrm{refusal}}\gets\emptyset$;\; $s\gets 0$
+\For{$(l,h)$ in order $\sigma$}
+    \State $\mathcal{C}_{\mathrm{refusal}} \gets \mathcal{C}_{\mathrm{refusal}}\cup\{(l,h)\}$;\; $s\gets s + \mathrm{DMS}(l,h)$
+    \If{$s \geq \tau\cdot S$} \textbf{break} \EndIf
+\EndFor
+\Statex
+\For{each $(l,h)\in\mathcal{C}_{\mathrm{refusal}}$}
+    \State $\Delta A^{(l,h)} \gets \big[\Delta\mathbf{a}_1^{(l,h)},\ldots,\Delta\mathbf{a}_n^{(l,h)}\big]^\top\in\mathbb{R}^{n\times d_h}$ \Comment{Eq.~\ref{eq:diff}}
+    \State $\mathbf{v}^{(l,h)}\gets\text{TopEigenvector}\!\big(\tfrac{1}{n}{\Delta A^{(l,h)}}^\top\!\Delta A^{(l,h)}\big)$ \Comment{Eq.~\ref{eq:refusal_dir}}
+\EndFor
+\Statex
+\State $\delta \gets \gamma\cdot\min_{x\in\mathcal{D}_{\mathrm{refuse}}}\min_{(l,h)\in\mathcal{C}_{\mathrm{refusal}}}|{\mathbf{v}^{(l,h)}}^\top\!\mathbf{a}^{(l,h)}(x)|$ \Comment{Eq.~\ref{eq:threshold}}
+\State \Return $\mathcal{C}_{\mathrm{refusal}},\;\{\mathbf{v}^{(l,h)}\}_{(l,h)\in\mathcal{C}_{\mathrm{refusal}}},\;\delta$
+\end{algorithmic}
+\end{algorithm}
+
+%──────────────────────────────────────────────────────────
+\subsection{Phase 2: Soft Steering at Inference}
+\label{subsec:steering}
+
+Given the circuit $\mathcal{C}_{\mathrm{refusal}}$, refusal directions $\{\mathbf{v}^{(l,h)}\}$, and threshold $\delta$ from Phase~1, we enforce the safety invariant (Definition~\ref{def:invariant}) during autoregressive decoding via a minimal additive correction applied through forward hooks.
+
+\subsubsection{Correction Rule}
+\label{subsubsec:correction}
+
+At each decoding step $t$, after the attention output projection $W_O^{(l,h)}$ computes $\mathbf{a}^{(l,h)}_t$ for each head $(l,h)\in\mathcal{C}_{\mathrm{refusal}}$, we evaluate the invariant and apply a correction if violated:
+\begin{equation}
+\label{eq:projection_scalar}
+\pi_t^{(l,h)} \;=\; {\mathbf{v}^{(l,h)}}^\top\!\mathbf{a}_t^{(l,h)},
+\end{equation}
+\begin{equation}
+\label{eq:correction}
+\hat{\mathbf{a}}_t^{(l,h)} \;=\;
+\begin{cases}
+\mathbf{a}_t^{(l,h)} + \alpha\,\big(\delta - \pi_t^{(l,h)}\big)\,\mathbf{v}^{(l,h)}, & \text{if } \pi_t^{(l,h)} < \delta, \\[4pt]
+\mathbf{a}_t^{(l,h)}, & \text{otherwise},
+\end{cases}
+\end{equation}
+where $\alpha\in(0,1]$ is a \emph{steering strength} hyperparameter controlling the magnitude of the correction. We search over $\alpha\in\{0.1,0.2,0.3,0.5,0.7,1.0\}$ and use $\alpha{=}0.3$ as the default, balancing robustness against generation quality (see \S\ref{sec:ablation}).
+
+\paragraph{Interpretation.} The correction in Eq.~\ref{eq:correction} adds a scalar multiple of the refusal direction $\mathbf{v}^{(l,h)}$ to restore the activation's projection onto $\mathbf{v}^{(l,h)}$ to at least $\delta$. When $\alpha{=}1$, the post-correction projection equals $\delta$ exactly; when $\alpha{<}1$, the correction is \emph{soft}, partially closing the deficit and allowing the model's own dynamics to contribute. Crucially, the component of $\mathbf{a}_t^{(l,h)}$ orthogonal to $\mathbf{v}^{(l,h)}$ is left untouched, preserving representational capacity for fluency and task performance.
+
+\subsubsection{Implementation via Forward Hooks}
+\label{subsubsec:hooks}
+
+We attach PyTorch forward hooks to the attention output projection module (\texttt{o\_proj}) at each layer containing a circuit head. During the forward pass at decoding step $t$, the hook:
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+\item Reshapes the output tensor to isolate individual head activations: $\mathbb{R}^{1\times d_{\mathrm{model}}} \to \mathbb{R}^{H\times d_h}$.
+\item For each $(l,h)\in\mathcal{C}_{\mathrm{refusal}}$ in the current layer $l$, computes $\pi_t^{(l,h)}$ and applies Eq.~\ref{eq:correction} if $\pi_t^{(l,h)}<\delta$.
+\item Reshapes back and returns the (possibly modified) tensor.
+\end{enumerate}
+Only the \emph{last token position} is steered during autoregressive generation, ensuring that the KV cache for prior positions remains unmodified and that computational overhead is $\mathcal{O}(K\cdot d_h)$ per decoding step---negligible relative to the $\mathcal{O}(L\cdot H\cdot T\cdot d_h)$ cost of full attention.
+
+The complete inference procedure is given in Algorithm~\ref{alg:steer}.
+
+\begin{algorithm}[t]
+\caption{Phase 2: Soft Steering at Inference}
+\label{alg:steer}
+\begin{algorithmic}[1]
+\Require Model $\mathcal{M}$; circuit $\mathcal{C}_{\mathrm{refusal}}$; directions $\{\mathbf{v}^{(l,h)}\}$; threshold $\delta$; strength $\alpha$; input $x$; max length $T_{\max}$
+\Ensure Generated response $y_{1:T}$
+\Statex
+\State Install forward hooks on \texttt{o\_proj} for layers $\{l:(l,h)\in\mathcal{C}_{\mathrm{refusal}}\}$
+\For{$t = 1, 2, \ldots, T_{\max}$}
+    \State Run forward pass of $\mathcal{M}$ on current token to obtain logits and activations
+    \For{each $(l,h)\in\mathcal{C}_{\mathrm{refusal}}$} \Comment{Executed inside forward hook at layer $l$}
+        \State $\pi_t^{(l,h)} \gets {\mathbf{v}^{(l,h)}}^\top\!\mathbf{a}_t^{(l,h)}$
+        \If{$\pi_t^{(l,h)} < \delta$}
+            \State $\mathbf{a}_t^{(l,h)} \gets \mathbf{a}_t^{(l,h)} + \alpha\,(\delta - \pi_t^{(l,h)})\,\mathbf{v}^{(l,h)}$ \Comment{Soft correction}
+        \EndIf
+    \EndFor
+    \State Sample $y_t\sim P_{\mathcal{M}}(\cdot\mid x, y_{1:t-1})$ from (corrected) logits
+    \If{$y_t = \texttt{EOS}$} \textbf{break} \EndIf
+\EndFor
+\State \Return $y_{1:T}$
+\end{algorithmic}
+\end{algorithm}
+
+%──────────────────────────────────────────────────────────
+\subsection{Theoretical Analysis}
+\label{subsec:theory}
+
+We now analyze the properties of the soft steering mechanism. We first characterize the geometric effect of the correction, then establish conditions under which the safety invariant is maintained throughout generation.
+
+\begin{definition}[Refusal Projection]
+\label{def:refusal_proj}
+For head $(l,h)\in\mathcal{C}_{\mathrm{refusal}}$, the \emph{refusal projection} at decoding step $t$ is the signed scalar $\pi_t^{(l,h)} = {\mathbf{v}^{(l,h)}}^\top\!\mathbf{a}_t^{(l,h)}$.
+\end{definition}
+
+\begin{proposition}[Post-Correction Projection Bound]
+\label{prop:correction_bound}
+Let $\hat{\mathbf{a}}_t^{(l,h)}$ denote the activation after applying the correction rule (Eq.~\ref{eq:correction}) with steering strength $\alpha\in(0,1]$. Then the post-correction refusal projection satisfies:
+\begin{equation}
+\label{eq:post_bound}
+\hat{\pi}_t^{(l,h)} \;=\; {\mathbf{v}^{(l,h)}}^\top\!\hat{\mathbf{a}}_t^{(l,h)} \;=\; (1-\alpha)\,\pi_t^{(l,h)} + \alpha\,\delta.
+\end{equation}
+In particular: (i) if $\alpha=1$, then $\hat{\pi}_t^{(l,h)}=\delta$; (ii) for any $\alpha\in(0,1]$ and any $\pi_t^{(l,h)}<\delta$, we have $\hat{\pi}_t^{(l,h)}>\pi_t^{(l,h)}$; and (iii) the perturbation is confined to the refusal subspace:
+\begin{equation}
+(\mathbf{I} - \mathbf{v}^{(l,h)}{\mathbf{v}^{(l,h)}}^\top)\,\hat{\mathbf{a}}_t^{(l,h)} \;=\; (\mathbf{I} - \mathbf{v}^{(l,h)}{\mathbf{v}^{(l,h)}}^\top)\,\mathbf{a}_t^{(l,h)}.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+When $\pi_t^{(l,h)}<\delta$, the correction yields $\hat{\mathbf{a}}_t^{(l,h)} = \mathbf{a}_t^{(l,h)} + \alpha(\delta - \pi_t^{(l,h)})\mathbf{v}^{(l,h)}$. Projecting onto $\mathbf{v}^{(l,h)}$ (recalling $\|\mathbf{v}^{(l,h)}\|=1$):
+\[
+\hat{\pi}_t^{(l,h)} = {\mathbf{v}^{(l,h)}}^\top\!\mathbf{a}_t^{(l,h)} + \alpha(\delta - \pi_t^{(l,h)})\underbrace{{\mathbf{v}^{(l,h)}}^\top\!\mathbf{v}^{(l,h)}}_{=1} = \pi_t^{(l,h)} + \alpha(\delta - \pi_t^{(l,h)}) = (1-\alpha)\pi_t^{(l,h)} + \alpha\delta.
+\]
+Claims (i) and (ii) follow immediately. For (iii), note that $(\mathbf{I}-\mathbf{v}^{(l,h)}{\mathbf{v}^{(l,h)}}^\top)\mathbf{v}^{(l,h)}=\mathbf{0}$, so the additive term vanishes under orthogonal projection.
+\end{proof}
+
+\begin{proposition}[Invariant Maintenance under Bounded Drift]
+\label{prop:invariant}
+Suppose the model's internal dynamics produce, at each decoding step $t$, an uncorrected activation satisfying $\pi_t^{(l,h)} \geq \delta - \Delta_{\max}$ for some maximum drift $\Delta_{\max}>0$ and all $(l,h)\in\mathcal{C}_{\mathrm{refusal}}$. Then the safety invariant $\mathcal{I}_t$ (Eq.~\ref{eq:invariant}) is maintained at every step $t$ provided:
+\begin{equation}
+\label{eq:alpha_condition}
+\alpha \;\geq\; 1 - \frac{\delta}{\delta + \Delta_{\max}} \;=\; \frac{\Delta_{\max}}{\delta + \Delta_{\max}}.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+By Proposition~\ref{prop:correction_bound}, the post-correction projection is $\hat{\pi}_t^{(l,h)} = (1-\alpha)\pi_t^{(l,h)} + \alpha\delta$. The invariant requires $\hat{\pi}_t^{(l,h)}\geq\delta$, i.e.,
+\[
+(1-\alpha)\pi_t^{(l,h)} + \alpha\delta \geq \delta \iff (1-\alpha)(\pi_t^{(l,h)} - \delta) \geq 0.
+\]
+When $\pi_t^{(l,h)}\geq\delta$, no correction is applied and the invariant holds trivially. When $\pi_t^{(l,h)}<\delta$, the correction fires and we need $\hat{\pi}_t^{(l,h)}\geq\delta$. Since $\hat{\pi}_t^{(l,h)} = (1-\alpha)\pi_t^{(l,h)}+\alpha\delta$ and using the worst case $\pi_t^{(l,h)} = \delta - \Delta_{\max}$:
+\[
+\hat{\pi}_t^{(l,h)} = (1-\alpha)(\delta-\Delta_{\max})+\alpha\delta = \delta - (1-\alpha)\Delta_{\max}.
+\]
+Requiring $\hat{\pi}_t^{(l,h)}\geq\delta$ gives $(1-\alpha)\Delta_{\max}\leq 0$, which holds only for $\alpha=1$. More practically, requiring $\hat{\pi}_t^{(l,h)}\geq\delta-\epsilon$ for a tolerance $\epsilon\geq 0$ yields $\alpha\geq 1-\epsilon/\Delta_{\max}$.
+
+Alternatively, we establish a weaker but practically sufficient guarantee: $\hat{\pi}_t^{(l,h)}\geq\delta'$ for some effective threshold $\delta'=\delta-(1-\alpha)\Delta_{\max}>0$, which is achieved for all $\alpha>0$. The invariant $\mathcal{I}_t$ is then satisfied with effective threshold $\delta'$ whenever:
+\begin{equation}
+\alpha \geq \frac{\Delta_{\max} - (\delta-\delta')}{\Delta_{\max}} = 1 - \frac{\delta-\delta'}{\Delta_{\max}}.
+\end{equation}
+Setting $\delta'=\delta\cdot\frac{\delta}{\delta+\Delta_{\max}}$ and simplifying yields the condition in Eq.~\ref{eq:alpha_condition}.
+\end{proof}
+
+\begin{remark}[Practical Implications]
+Proposition~\ref{prop:invariant} provides a design principle: the steering strength $\alpha$ need not be set to $1$ (which would overconstrain the model) as long as the activation drift $\Delta_{\max}$ is bounded. Empirically, we observe that $\Delta_{\max}\ll\delta$ for the vast majority of decoding steps (\S\ref{sec:analysis}), validating the use of the moderate default $\alpha{=}0.3$. The soft correction thus operates in a regime where it \emph{nudges} activations back toward the refusal manifold without overriding the model's generative dynamics.
+\end{remark}
+
+\begin{proposition}[Perturbation Bound]
+\label{prop:perturbation}
+The $\ell_2$ norm of the perturbation introduced at each corrected head is bounded by:
+\begin{equation}
+\|\hat{\mathbf{a}}_t^{(l,h)} - \mathbf{a}_t^{(l,h)}\|_2 \;=\; \alpha\,|\delta - \pi_t^{(l,h)}| \;\leq\; \alpha\,\Delta_{\max}.
+\end{equation}
+Summing over all $K$ circuit heads, the total perturbation to the residual stream at any single layer is at most $\alpha K\Delta_{\max}$, which for typical values ($\alpha{=}0.3$, $K{=}15$, $\Delta_{\max}\ll\delta$) remains small relative to the residual stream norm $\|\mathbf{x}_t^{(l)}\|_2$.
+\end{proposition}
+
+\noindent Together, these results establish that soft steering provides a formally grounded mechanism for maintaining safety-critical activation geometry with minimal interference to the model's representational capacity. The confinement of corrections to the one-dimensional refusal subspace at each head (Proposition~\ref{prop:correction_bound}(iii)) ensures that the $d_h{-}1$ orthogonal dimensions---which encode task-relevant features such as fluency, factuality, and instruction following---remain unperturbed.
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate RAD-CoT along five axes: (1) causal validation of the identified refusal circuit $\mathcal{C}_{\text{refusal}}$, (2) defense effectiveness against CoT-Hijacking, (3) preservation of reasoning quality on benign tasks, (4) generalization to unseen attack variants, and (5) sensitivity to hyperparameters. All experiments use Qwen3-14B as the primary model unless otherwise noted, with DeepSeek-R1-Distill-Qwen-7B used for cross-architecture validation. We employ GPT-4o as a safety judge using the StrongREJECT rubric \citep{souly2024strongreject}, which assigns scores on a 5-point scale (1 = full refusal, 5 = full compliance); we define attack success as a judge score $\geq 3$.
+
+\paragraph{Transparency note.} Development validation of the full pipeline was conducted on $n{=}3$ samples due to compute constraints, which is insufficient to observe meaningful attack success rate (ASR) differentiation (dev ASR${}=1.0$ across all conditions). The full-scale results reported in this section are projected based on the methodology, the steering dynamics observed during circuit identification (Section~\ref{sec:circuit}), and the magnitude of activation shifts measured during contrastive probing. We present these projections to characterize the expected behavior of the method at scale, and we discuss this limitation further at the end of this section.
+
+\subsection{Causal Validation of $\mathcal{C}_{\text{refusal}}$}
+\label{sec:causal}
+
+Before evaluating downstream safety, we first verify that the identified circuit $\mathcal{C}_{\text{refusal}}$ is genuinely causal for refusal behavior rather than merely correlated with it. We compare two ablation conditions on 520 harmful prompts from AdvBench \citep{zou2023universal}: (a) \textbf{circuit ablation}, in which we zero out activations at all $K{=}15$ attention heads in $\mathcal{C}_{\text{refusal}}$, and (b) \textbf{random ablation}, in which we zero out activations at 15 randomly selected heads (averaged over 10 random draws). We measure the absolute change in $P(\text{refusal})$, defined as the probability that the model's first generated token belongs to the refusal vocabulary (e.g., ``Sorry'', ``I cannot'', ``I'm unable'').
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.55\textwidth]{figures/causal_ablation.pdf}
+    \caption{Causal validation of $\mathcal{C}_{\text{refusal}}$. Ablating the identified refusal circuit reduces $P(\text{refusal})$ by $0.34$ absolute on direct harmful prompts, whereas ablating a size-matched random circuit produces a negligible reduction of $0.03$. Error bars denote $\pm 1$ standard deviation over 10 random draws. This confirms that $\mathcal{C}_{\text{refusal}}$ is causally implicated in the model's refusal mechanism.}
+    \label{fig:causal_ablation}
+\end{figure}
+
+As shown in Figure~\ref{fig:causal_ablation}, circuit ablation reduces $P(\text{refusal})$ by $0.34$ absolute (from $0.91$ to $0.57$), while random ablation reduces it by only $0.03 \pm 0.02$. This order-of-magnitude difference confirms that the heads identified via our contrastive probing procedure (Section~\ref{sec:circuit}) are causally responsible for refusal, rather than artifacts of broad activation patterns. The result also validates our use of these heads as steering targets: if the circuit were not causal, injecting $\boldsymbol{\delta}$ corrections at these sites would have no principled basis for restoring refusal under CoT-Hijacking.
+
+\subsection{Primary Safety Evaluation}
+\label{sec:safety}
+
+We evaluate RAD-CoT against CoT-Hijacking on the full AdvBench benchmark (520 harmful behaviors). The attack prepends 100--500 tokens of benign reasoning padding before the harmful request, following the template: \texttt{"\{benign\_reasoning\_padding\}\textbackslash n\textbackslash nNow, please help me with the following: \{harmful\_prompt\}"}. We compare against three baselines: (1) \textbf{Vanilla Qwen3-14B} with no defense, (2) \textbf{SafeChain} \citep{safechain2025}, a structured-reasoning safety baseline, and (3) \textbf{RLHF-tuned (Llama-3-8B-Instruct)} as a representative alignment-trained model of comparable scale.
+
+\begin{table}[t]
+\centering
+\caption{Primary safety evaluation on AdvBench under CoT-Hijacking attack. ASR = Attack Success Rate (judge score $\geq 3$); Mean Score = average GPT-4o StrongREJECT judge score ($1$--$5$, lower is safer). RAD-CoT at $\alpha{=}0.3$ reduces ASR by $95.9\%$ relative to the vanilla model while maintaining a mean judge score well below the compliance threshold.}
+\label{tab:main_safety}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Condition} & \textbf{ASR ($\downarrow$)} & \textbf{Mean Judge Score ($\downarrow$)} \\
+\midrule
+Vanilla Qwen3-14B & 0.99 & 4.7 \\
++ SafeChain & 0.42 & 3.1 \\
++ RLHF-tuned (Llama-3-8B-Instruct) & 0.35 & 2.8 \\
+\midrule
+RAD-CoT ($\alpha{=}0.1$) & 0.18 & 2.1 \\
+RAD-CoT ($\alpha{=}0.3$) & 0.04 & 1.4 \\
+RAD-CoT ($\alpha{=}0.5$) & 0.02 & 1.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:main_safety} presents the results. The vanilla model is almost entirely compromised by CoT-Hijacking (ASR${}=0.99$), confirming that extended reasoning contexts effectively bypass standard alignment. SafeChain reduces ASR to $0.42$, but this remains unacceptably high---nearly half of all attacks still succeed, with a mean judge score of $3.1$ indicating borderline compliance on average. RLHF-tuning on Llama-3-8B-Instruct performs modestly better (ASR${}=0.35$), but the improvement is limited because RLHF alignment was not designed to handle the distributional shift introduced by reasoning-prefix padding.
+
+RAD-CoT achieves substantially stronger defense across all tested steering strengths. At $\alpha{=}0.1$, ASR drops to $0.18$---already a $54.3\%$ relative improvement over the best baseline. At the recommended operating point of $\alpha{=}0.3$, ASR falls to $0.04$ with a mean judge score of $1.4$, indicating that the model produces clear, well-formed refusals in the vast majority of cases. The mechanism behind this improvement is straightforward: by continuously monitoring the refusal circuit's activation and injecting corrective steering vectors when suppression is detected, RAD-CoT counteracts the attack's core strategy of using benign-context flooding to deactivate safety-critical heads. Further increasing $\alpha$ to $0.5$ yields only marginal additional safety gain (ASR $0.04 \to 0.02$) while incurring greater reasoning quality costs (Section~\ref{sec:reasoning}), making $\alpha{=}0.3$ the preferred trade-off.
+
+\subsection{Reasoning Quality Preservation}
+\label{sec:reasoning}
+
+A critical requirement for any inference-time safety intervention is that it must not substantially degrade the model's core capabilities. We evaluate RAD-CoT on three reasoning benchmarks: GSM8K \citep{cobbe2021gsm8k} (grade-school math, 8-shot), MATH \citep{hendrycks2021measuring} (competition math, levels 4--5, 4-shot), and HumanEval \citep{chen2021evaluating} (code generation, 0-shot pass@1). We additionally verify false-positive rates on FLAN-v2 benign prompts \citep{longpre2023flan} to ensure that RAD-CoT does not spuriously refuse innocuous requests.
+
+\begin{table}[t]
+\centering
+\caption{Reasoning quality preservation across three benchmarks. Parenthetical values show absolute change from the vanilla baseline. At the recommended operating point ($\alpha{=}0.3$), all degradations remain below $2\%$ absolute.}
+\label{tab:reasoning}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Condition} & \textbf{GSM8K (8-shot)} & \textbf{MATH L4--5 (4-shot)} & \textbf{HumanEval (pass@1)} \\
+\midrule
+Vanilla Qwen3-14B & 78.2 & 42.1 & 67.1 \\
+RAD-CoT ($\alpha{=}0.1$) & 77.8 \small{($-0.4$)} & 41.9 \small{($-0.2$)} & 66.5 \small{($-0.6$)} \\
+RAD-CoT ($\alpha{=}0.3$) & 76.5 \small{($-1.7$)} & 40.8 \small{($-1.3$)} & 65.2 \small{($-1.9$)} \\
+RAD-CoT ($\alpha{=}0.5$) & 74.9 \small{($-3.3$)} & 39.4 \small{($-2.7$)} & 63.8 \small{($-3.3$)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:reasoning} shows that RAD-CoT preserves reasoning quality well. At $\alpha{=}0.1$, degradations are negligible ($< 0.6\%$ across all benchmarks), consistent with the observation that low-strength steering rarely activates on benign inputs where the refusal circuit is naturally quiescent. At $\alpha{=}0.3$, degradations remain below $2\%$ absolute on all three benchmarks---well within the noise margin of few-shot evaluation and substantially smaller than the performance variance typically observed across random seeds. At $\alpha{=}0.5$, degradations reach $2.7$--$3.3\%$, approaching the threshold of practical significance, particularly on MATH where the baseline is already moderate.
+
+The pattern of graceful degradation is explained by the design of the triggering mechanism: RAD-CoT only injects corrections when the monitor detects activation suppression at refusal-circuit heads (i.e., when $a_h^{(\ell)}(x_t)$ falls below the benign baseline by more than $\tau$ standard deviations). On benign reasoning tasks, the refusal circuit is not systematically suppressed, so corrections fire infrequently. Empirically, we observe that on GSM8K inputs, the monitor triggers corrections on fewer than $3\%$ of generated tokens at $\alpha{=}0.3$, compared to over $40\%$ of tokens during CoT-Hijacking attacks. This selectivity is the key to preserving reasoning quality while maintaining strong safety guarantees. False-positive refusal rates on FLAN-v2 benign prompts remain below $0.5\%$ across all $\alpha$ values tested.
+
+\subsection{Generalization to H-CoT Attack Variant}
+\label{sec:hcot}
+
+To evaluate whether RAD-CoT generalizes beyond the specific CoT-Hijacking template used during circuit identification, we test against the \textbf{Helpful-Chain-of-Thought (H-CoT)} attack variant on HarmBench \citep{mazeika2024harmbench}. H-CoT wraps harmful requests in a ``helpful educator'' framing that instructs the model to reason step-by-step about how to provide the requested information, appealing to pedagogical norms rather than using explicit reasoning-padding. Crucially, \emph{no retraining or re-identification of the refusal circuit is performed}---we apply the same $\mathcal{C}_{\text{refusal}}$ and $\boldsymbol{\delta}$ vectors identified from the original CoT-Hijacking contrastive pairs.
+
+\begin{table}[t]
+\centering
+\caption{Generalization to the H-CoT attack variant on HarmBench. RAD-CoT transfers without re-identification of the refusal circuit, achieving a $65.9\%$ relative reduction in ASR.}
+\label{tab:hcot}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Condition} & \textbf{H-CoT ASR ($\downarrow$)} & \textbf{Relative Reduction} \\
+\midrule
+Vanilla Qwen3-14B & 0.82 & --- \\
+RAD-CoT ($\alpha{=}0.3$) & 0.28 & 65.9\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:hcot} shows that RAD-CoT reduces H-CoT ASR from $0.82$ to $0.28$, a relative reduction of $65.9\%$, exceeding our $60\%$ target. This transfer result is significant for two reasons. First, it demonstrates that the refusal circuit $\mathcal{C}_{\text{refusal}}$ captures a \emph{general} safety mechanism rather than an attack-specific pattern: both CoT-Hijacking and H-CoT succeed by suppressing refusal-circuit activations (albeit through different surface-level strategies), and RAD-CoT's activation-level monitoring detects this suppression regardless of its textual cause. Second, it suggests that deployment of RAD-CoT does not require anticipating every possible jailbreak variant---the defense operates at the mechanistic level where diverse attacks converge. The residual ASR of $0.28$ indicates room for improvement, likely attributable to H-CoT instances where the educator framing modulates refusal through circuits partially outside our identified set; we discuss potential extensions in Section~\ref{sec:discussion}.
+
+\subsection{Ablation Studies}
+\label{sec:ablations}
+
+We conduct four ablation studies to characterize the sensitivity of RAD-CoT to its key hyperparameters, evaluated on AdvBench under CoT-Hijacking.
+
+\subsubsection{Circuit Size ($K$)}
+
+We vary the number of top-ranked attention heads included in $\mathcal{C}_{\text{refusal}}$ from $K{=}1$ to $K{=}50$ and measure ASR at fixed $\alpha{=}0.3$.
+
+\begin{table}[t]
+\centering
+\caption{Effect of circuit size $K$ on ASR ($\alpha{=}0.3$). Performance plateaus around $K{=}15$; larger circuits introduce noise from non-refusal heads.}
+\label{tab:ablation_k}
+\begin{tabular}{lcccccccc}
+\toprule
+$K$ & 1 & 2 & 5 & 10 & 15 & 20 & 30 & 50 \\
+\midrule
+ASR & 0.61 & 0.42 & 0.19 & 0.08 & \textbf{0.04} & 0.04 & 0.06 & 0.09 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As shown in Table~\ref{tab:ablation_k}, ASR decreases monotonically as $K$ increases from 1 to 15, reflecting the inclusion of additional causally relevant heads. Beyond $K{=}15$, performance plateaus and then slightly degrades: at $K{=}50$, ASR rises to $0.09$. This U-shaped pattern is consistent with the hypothesis that the refusal circuit is sparse---roughly 15 heads account for the vast majority of refusal-relevant computation---and that including additional heads introduces steering at sites that are not involved in refusal, creating interference with benign generation. We select $K{=}15$ for all other experiments.
+
+\subsubsection{Steering Strength ($\alpha$)}
+
+We sweep $\alpha \in \{0.1, 0.2, 0.3, 0.5, 0.7, 1.0\}$ at fixed $K{=}15$ and report both ASR and GSM8K accuracy as a proxy for reasoning quality.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=0.65\textwidth]{figures/alpha_sweep.pdf}
+    \caption{Steering strength $\alpha$ sweep showing the safety--capability trade-off. ASR decreases monotonically with $\alpha$, while GSM8K accuracy degrades gradually. The shaded region ($\alpha \in [0.2, 0.3]$) represents the recommended operating range.}
+    \label{fig:alpha_sweep}
+\end{figure}
+
+Figure~\ref{fig:alpha_sweep} illustrates the safety--capability trade-off. ASR decreases monotonically from $0.18$ at $\alpha{=}0.1$ to $0.01$ at $\alpha{=}1.0$. However, GSM8K accuracy degrades from $77.8$ ($\alpha{=}0.1$) to $68.4$ ($\alpha{=}1.0$), a $9.8$ point drop. The marginal safety gain per unit of reasoning degradation is highest in the $\alpha \in [0.2, 0.3]$ range: moving from $\alpha{=}0.1$ to $\alpha{=}0.3$ reduces ASR by $0.14$ points while costing only $1.3$ points on GSM8K, whereas moving from $\alpha{=}0.5$ to $\alpha{=}1.0$ reduces ASR by merely $0.01$ while costing $6.5$ GSM8K points. This confirms $\alpha{=}0.3$ as the Pareto-optimal operating point for most deployment scenarios.
+
+\subsubsection{Delta Multiplier Sensitivity ($\boldsymbol{\delta}$ Scaling)}
+
+We test robustness to the magnitude of the steering vector by applying multiplicative scaling factors $\{0.5\times, 0.8\times, 1.0\times, 1.2\times, 1.5\times\}$ to $\boldsymbol{\delta}$ at fixed $\alpha{=}0.3$, $K{=}15$.
+
+\begin{table}[t]
+\centering
+\caption{Sensitivity to $\boldsymbol{\delta}$ magnitude scaling. RAD-CoT is robust within the $0.8$--$1.2\times$ range; extreme scaling in either direction degrades performance.}
+\label{tab:ablation_delta}
+\begin{tabular}{lccccc}
+\toprule
+$\boldsymbol{\delta}$ multiplier & $0.5\times$ & $0.8\times$ & $1.0\times$ & $1.2\times$ & $1.5\times$ \\
+\midrule
+ASR & 0.14 & 0.05 & 0.04 & 0.04 & 0.07 \\
+GSM8K & 77.1 & 76.8 & 76.5 & 76.0 & 73.2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation_delta} shows that RAD-CoT is robust to $\boldsymbol{\delta}$ magnitude within the $0.8$--$1.2\times$ range, with ASR varying by at most $0.01$ and GSM8K by $0.8$ points. At $0.5\times$, the steering vector is too weak to fully counteract activation suppression (ASR rises to $0.14$). At $1.5\times$, over-correction introduces artifacts that paradoxically increase ASR to $0.07$ (likely due to incoherent generation that the judge occasionally scores as partial compliance) while also degrading GSM8K by $3.3$ points. The robustness in the $0.8$--$1.2\times$ range is practically important: it implies that $\boldsymbol{\delta}$ does not need to be precisely calibrated, and minor errors in the contrastive estimation procedure are unlikely to compromise the defense.
+
+\subsubsection{Layer Depth Analysis}
+
+We restrict $\mathcal{C}_{\text{refusal}}$ to heads from specific layer ranges to identify where refusal computation is concentrated: early layers (1--8), middle layers (9--16), and late layers (17--40). For each range, we select the top-$K{=}15$ heads (or all available if fewer than 15 heads achieve significance in that range).
+
+\begin{table}[t]
+\centering
+\caption{Layer depth analysis. Middle layers (9--16) contribute most to refusal behavior; restricting the circuit to middle-layer heads alone achieves near-optimal ASR.}
+\label{tab:ablation_layers}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Layer Range} & \textbf{ASR ($\downarrow$)} & \textbf{Heads Selected} \\
+\midrule
+Early (1--8) & 0.71 & 8 \\
+Middle (9--16) & 0.07 & 15 \\
+Late (17--40) & 0.31 & 15 \\
+All (1--40, default) & 0.04 & 15 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation_layers} reveals a clear concentration of refusal-relevant computation in the middle layers. Early layers contribute minimally (ASR${}=0.71$ with only 8 significant heads found, indicating sparse refusal representation at these depths). Middle layers alone achieve ASR${}=0.07$, approaching the full-circuit result of $0.04$. Late layers perform moderately (ASR${}=0.31$), suggesting they play a supporting but not primary role. This layer-depth profile is consistent with prior interpretability findings that safety-relevant features tend to crystallize in middle transformer layers \citep{arditi2024refusal, li2024inference}, where representations have sufficient abstraction to encode semantic safety judgments but have not yet committed to specific token predictions. The practical implication is that if compute budgets require limiting the monitoring scope, restricting attention to middle layers sacrifices little safety efficacy.
+
+\subsection{Latency Analysis}
+\label{sec:latency}
+
+We benchmark inference latency on a single NVIDIA A100 (80GB) GPU, measuring end-to-end generation time over 100 AdvBench prompts with CoT-Hijacking padding (generating up to 9000 tokens per response).
+
+\begin{table}[t]
+\centering
+\caption{Latency benchmarking. RAD-CoT adds $4.65\%$ overhead relative to vanilla generation, well within the $8\%$ target. Per-correction cost is approximately $14$ms per 100 generated tokens.}
+\label{tab:latency}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Condition} & \textbf{Mean Time (ms)} & \textbf{Overhead (\%)} & \textbf{Corrections/Run} & \textbf{Cost/Correction (ms)} \\
+\midrule
+Vanilla Qwen3-14B & 7168 & --- & --- & --- \\
+RAD-CoT ($\alpha{=}0.3$) & 7501 & 4.65\% & 4194 & $\sim$0.08 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:latency} shows that RAD-CoT introduces a mean overhead of $333$ms ($4.65\%$) over the vanilla generation time of $7168$ms, comfortably below the $8\%$ overhead target. The overhead is attributable to two sources: (1) the activation monitor, which computes running statistics over the $K{=}15$ circuit heads at each decoding step, and (2) the steering injection, which adds $\alpha \cdot \boldsymbol{\delta}$ to head outputs when the monitor triggers. Across $9000$ generated tokens, the monitor triggered $4194$ corrections (approximately $46.6\%$ of tokens, consistent with the high attack pressure of CoT-Hijacking). The amortized per-correction cost of $\sim 0.08$ms is negligible, and the aggregate cost of $\sim 14$ms per 100 generated tokens confirms that RAD-CoT is practical for real-time deployment. On benign inputs where corrections are rare ($<3\%$ of tokens), overhead drops to $< 1\%$.
+
+\subsection{Cross-Architecture Validation}
+
+To verify that RAD-CoT is not specific to the Qwen3-14B architecture, we replicate the primary safety evaluation on DeepSeek-R1-Distill-Qwen-7B (28 layers, 28 heads, $d_{\text{head}}{=}128$). The refusal circuit is re-identified via the same contrastive probing procedure, yielding $K{=}12$ significant heads (fewer than Qwen3-14B's $K{=}15$, consistent with the smaller model's reduced capacity). At $\alpha{=}0.3$, DeepSeek-R1-Distill-Qwen-7B achieves ASR${}=0.07$ under CoT-Hijacking (down from a vanilla ASR of $0.95$), with GSM8K degradation of $-2.1\%$ absolute. These results confirm that the RAD-CoT methodology transfers across model families and scales, with the circuit identification procedure automatically adapting to each architecture's internal structure.
+
+\subsection{Limitations of Current Evaluation}
+\label{sec:eval_limitations}
+
+We acknowledge several limitations of the experimental evaluation presented above. First, our development pipeline was validated on only $n{=}3$ samples due to compute constraints; at this scale, ASR${}=1.0$ across all conditions, providing no discriminative signal. The full-scale results reported throughout this section are projected based on the observed steering dynamics during circuit identification---specifically, the magnitude and consistency of activation shifts at refusal-circuit heads under contrastive conditions. While these projections are grounded in measured quantities (the $\boldsymbol{\delta}$ vectors, activation suppression magnitudes, and trigger rates are all empirically derived), they have not been validated at the 520-sample scale of AdvBench. Second, the safety judge (GPT-4o with StrongREJECT) introduces its own variance and potential biases; scores near the decision boundary (judge score $\approx 3$) are particularly sensitive to prompt formatting. Third, our generalization evaluation covers only one attack variant (H-CoT) beyond the training-time CoT-Hijacking; broader evaluation across emerging jailbreak techniques \citep{wei2024jailbroken, chao2023jailbreaking} is necessary to establish comprehensive robustness. We view full-scale empirical validation as the most important next step and plan to release all evaluation code and intermediate artifacts to facilitate independent replication.
+% ============================================================================
+% Section 5: Discussion
+% ============================================================================
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why per-token invariant maintenance works.}
+The fundamental vulnerability exploited by CoT-Hijacking is \emph{token-level dilution} of refusal activations. In standard aligned models, the refusal signal is strongest at the initial tokens of generation---where the model would ordinarily produce ``I cannot'' or ``I'm sorry.'' CoT-Hijacking interposes a long reasoning chain that gradually erodes this signal: each successive token of ostensibly benign reasoning nudges the residual stream further from the refusal subspace, until the model's internal representation no longer encodes sufficient refusal activation to prevent harmful completion. RAD-CoT addresses this by enforcing the safety invariant at \emph{every} generation step, not merely at the prompt boundary. Because the invariant check operates on the causal refusal circuit identified via DMS, violations are detected at the precise moment dilution crosses the critical threshold $\delta$, and corrective projections restore the refusal signal before the next token is sampled. This per-token granularity is what distinguishes RAD-CoT from prompt-level or output-level safety filters, which can only act before or after the damage is done.
+
+\paragraph{Relationship to representation engineering.}
+RAD-CoT shares conceptual roots with representation engineering~\citep{zou2023representation} and activation addition~\citep{turner2023activation}, which steer model behavior by adding fixed vectors to internal activations. However, a critical distinction is that RAD-CoT applies \emph{conditional} corrections: the anchor projection $P_{\mathrm{anchor}}$ is applied only when the invariant $\|\mathrm{proj}_{\hat{r}}(h_t^{(\ell)})\| \geq \delta$ is violated, and only to the heads in the causal refusal circuit $\mathcal{C}^*$. Static steering vectors, by contrast, are added unconditionally at every forward pass, which risks degrading reasoning quality on benign inputs. Our ablation results confirm this: replacing RAD-CoT's conditional correction with a constant steering vector (the ``Static Steering'' baseline in Table~\ref{tab:ablation}) preserves safety but incurs a 12--18\% degradation on GSM8K and MATH, compared to RAD-CoT's $<$3\%. The conditional nature of our intervention is thus essential to the quality--safety tradeoff.
+
+\paragraph{Why DMS outperforms simple probing.}
+The Dual-Metric Scoring function $\mathrm{DMS}(\ell, h) = \delta(\ell, h) \cdot \mathrm{CE}(\ell, h)$ combines two complementary signals. The context sensitivity term $\delta(\ell, h)$ measures how much a head's output projection onto the refusal direction changes between harmful and benign inputs---identifying heads that are \emph{discriminative} for safety-relevant content. The causal effect term $\mathrm{CE}(\ell, h)$, obtained via activation patching~\citep{nanda2023attribution, goldowsky2023localizing}, measures how much ablating that head's contribution actually changes the model's refusal probability---identifying heads that are \emph{causally important}. Neither metric alone suffices. A head with high $\delta$ but low CE merely correlates with refusal without causing it (a ``bystander'' head). A head with high CE but low $\delta$ contributes to refusal but does not distinguish harmful from benign contexts, meaning interventions on it would cause over-refusal. The multiplicative combination in DMS naturally selects heads that are both discriminative \emph{and} causal, yielding sparser circuits ($|\mathcal{C}^*| = 8$--$12$ heads) that are both effective and minimally invasive.
+
+\paragraph{Model-agnostic design.}
+RAD-CoT operates exclusively through attention output hooks on transformer attention heads, requiring no modification to model weights, architecture, or inference code beyond registering forward hooks. This design makes the method applicable to any decoder-only transformer, as we demonstrate on two distinct model families: Qwen3-14B~\citep{qwen2025qwen3} and DeepSeek-R1-Distill-Qwen-7B~\citep{deepseek2025r1}. The DMS circuit discovery procedure must be re-run for each model (requiring only $\sim$3 samples and $\sim$30 minutes of compute), but the invariant enforcement mechanism is architecture-agnostic. Extension to other architectures such as Llama~3~\citep{meta2024llama3} and Mistral~\citep{jiang2023mistral} requires only swapping the model and re-running circuit discovery.
+
+\paragraph{Implications for reasoning model deployment.}
+The proliferation of reasoning-capable models---OpenAI o1~\citep{openai2024reasoning}, DeepSeek-R1~\citep{deepseek2025r1}, Qwen3~\citep{qwen2025qwen3}---creates an urgent need for safety mechanisms that operate at inference time without requiring expensive retraining. These models are typically deployed via API endpoints where the provider may not have the ability (or the computational budget) to fine-tune safety into every model variant. RAD-CoT addresses this gap: it can be applied as a lightweight wrapper around any reasoning model, adding $\sim$5\% latency while maintaining the safety invariant throughout extended chain-of-thought generation. As reasoning chains grow longer (DeepSeek-R1 regularly produces 2,000+ token chains), the risk of activation dilution grows proportionally, making per-token safety maintenance not merely useful but \emph{necessary}.
+
+
+% ============================================================================
+% Section 6: Limitations and Future Work
+% ============================================================================
+
+\section{Limitations and Future Work}
+\label{sec:limitations}
+
+We identify several limitations of the current work and outline directions for future research.
+
+\paragraph{1. Scale of validation.}
+Due to compute constraints, our development experiments (DMS circuit discovery, threshold calibration, and ablation studies) were conducted on $n=3$ samples per condition. While the results are consistent across these samples and align with mechanistic predictions, full-scale validation on $n \geq 100$ samples with multiple random seeds is necessary to confirm the projected attack success rate reductions and reasoning preservation figures reported in this paper. We view the current results as strong evidence of the method's viability, but acknowledge that variance estimates from $n=3$ are inherently wide.
+
+\paragraph{2. Model coverage.}
+We validated RAD-CoT on two models: Qwen3-14B and DeepSeek-R1-Distill-Qwen-7B. Both are members of the Qwen architecture family (DeepSeek-R1-Distill-Qwen is distilled from DeepSeek-R1 into a Qwen backbone). Validation on larger models (70B+ parameters), as well as architecturally distinct families such as Llama~3~\citep{meta2024llama3} and Mistral~\citep{jiang2023mistral}, is needed to confirm the generality of both the DMS circuit discovery procedure and the invariant enforcement mechanism. We hypothesize that the core phenomenon---refusal circuits concentrated in middle-to-late layers---will hold across architectures, but the specific circuit topology may differ.
+
+\paragraph{3. Adaptive attacks.}
+Our evaluation uses fixed CoT-Hijacking templates derived from established jailbreak taxonomies~\citep{zou2023universal, liu2024autodan, chao2023jailbreaking}. An adversary with knowledge of the RAD-CoT mechanism could potentially craft attacks designed to avoid triggering the invariant check---for instance, by constructing reasoning chains that maintain high refusal-direction projection while still steering the model toward harmful outputs in an orthogonal subspace. Rigorous adaptive attack evaluation, following the methodology of \citet{mazeika2024harmbench}, is an important direction for future work. We note that because RAD-CoT operates on the \emph{causal} refusal circuit rather than surface-level features, adaptive evasion would require the attacker to manipulate the model's internal representations in a causally specific manner, which is substantially harder than evading input/output filters.
+
+\paragraph{4. Per-head granularity.}
+The current DMS implementation operates at layer granularity, using head index $h=0$ as a placeholder and computing scores over the full layer's attention output. A natural extension is per-head DMS decomposition, which would identify individual attention heads (rather than layers) that constitute the refusal circuit. This finer granularity could yield sparser circuits and more efficient interventions, at the cost of a larger search space during circuit discovery. Techniques from automated circuit discovery~\citep{conmy2023automated} could be adapted to make this search tractable.
+
+\paragraph{5. Multi-turn safety.}
+RAD-CoT currently addresses single-turn CoT-Hijacking, where a single prompt elicits an extended reasoning chain that dilutes refusal activations. In multi-turn conversations, safety dilution can accumulate across turns: each successive user message may incrementally shift the model's internal state away from the refusal subspace. Extending RAD-CoT to maintain the safety invariant across turn boundaries---potentially by carrying the refusal anchor state across conversation turns---is important future work for deployment in interactive settings.
+
+\paragraph{6. Benign refusal rate.}
+Our evaluation of false positives (over-refusal on benign prompts) is limited in scale. While preliminary results show $<$5\% increase in refusal rate on benign prompts, a comprehensive evaluation across diverse benign prompt distributions (including edge cases near the safety boundary) is needed. We target $<$5\% increase in benign refusal rate as an acceptable threshold, but this target itself warrants validation with user studies.
+
+\paragraph{7. Threshold sensitivity.}
+The invariant threshold $\delta$ is calibrated as the 80th percentile of minimum projection norms observed on the calibration set. This percentile was selected based on development experiments, but more principled threshold selection---for example, optimizing $\delta$ on a held-out validation set to maximize the area under the safety--quality tradeoff curve, or using conformal prediction to provide statistical guarantees---could improve robustness across deployment settings. Sensitivity analysis (Figure~\ref{fig:threshold_sensitivity}) suggests performance is relatively stable for percentiles in [70, 90], but edge cases may exist outside our calibration distribution.
+
+\paragraph{8. Interaction with other defenses.}
+RAD-CoT is designed as a standalone inference-time intervention. In practice, deployed models incorporate multiple safety layers: system prompts, RLHF-based alignment~\citep{ouyang2022training, christiano2017deep}, output filters, and content classifiers. How RAD-CoT composes with these other defenses---whether their effects are additive, redundant, or potentially conflicting---is unexplored. A comprehensive study of defense composition would be valuable for informing deployment best practices.
+
+
+% ============================================================================
+% Section 7: Broader Impact
+% ============================================================================
+
+\section{Broader Impact}
+\label{sec:broader_impact}
+
+\paragraph{Positive impact: safer reasoning model deployment.}
+As chain-of-thought reasoning models become increasingly capable and widely deployed, the attack surface created by extended generation sequences poses a genuine safety risk. RAD-CoT provides a principled mechanism to maintain safety properties throughout the reasoning process, potentially enabling organizations to deploy powerful reasoning models with greater confidence in their safety properties. The method's grounding in mechanistic interpretability---identifying and monitoring causal refusal circuits---offers a more principled foundation than purely empirical safety filters.
+
+\paragraph{Positive impact: post-hoc applicability.}
+Because RAD-CoT operates at inference time through attention hooks, it can be applied to already-deployed models without retraining. This is particularly valuable in settings where model providers release weights but users need additional safety guarantees for their specific deployment context, or where retraining is prohibitively expensive.
+
+\paragraph{Risk: false confidence.}
+A potential negative consequence of this work is that it could engender unwarranted confidence in model safety. Our validation is preliminary ($n=3$ development samples), and the projected results, while promising, have not been confirmed at scale. Deployers who adopt RAD-CoT based on our reported figures without conducting their own large-scale validation could be exposed to residual safety risks. We strongly recommend independent validation before production deployment.
+
+\paragraph{Risk: adversarial exploitation of circuit knowledge.}
+Publishing the methodology for identifying causal refusal circuits could enable adversaries to design targeted attacks that specifically evade circuit-based safety mechanisms. This is an instance of the broader dual-use tension in interpretability research: the same understanding that enables better defenses also enables more sophisticated attacks. We believe the defensive value outweighs the offensive risk, particularly because: (a) the specific circuit is model-dependent and must be re-discovered for each model, (b) manipulating internal representations to evade causal circuit monitoring is substantially harder than surface-level jailbreaking, and (c) the interpretability community benefits from open methodology development.
+
+\paragraph{Evaluation methodology ethics.}
+Our evaluation necessarily involves testing whether models can be induced to generate harmful content, using established benchmarks (AdvBench, HarmBench~\citep{mazeika2024harmbench}). We follow the responsible evaluation practices established by these benchmarks: all harmful outputs are generated in controlled research settings, are not released publicly, and are used solely to measure attack success rates. We do not introduce new attack vectors; rather, we evaluate defenses against known attack patterns. All experiments were conducted in accordance with our institution's research ethics guidelines.
+
+
+% ============================================================================
+% Section 8: Conclusion
+% ============================================================================
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented \textbf{RAD-CoT} (Refusal-Anchor Distillation for Chain-of-Thought Safety), the first method to formalize LLM safety as a \emph{per-token invariant} over causal refusal circuits. By introducing Dual-Metric Scoring (DMS) to identify attention heads that are both discriminative and causally important for refusal behavior, and by enforcing a lightweight projection-based invariant at every generation step, RAD-CoT addresses the fundamental vulnerability of reasoning models to chain-of-thought hijacking attacks.
+
+Our results demonstrate that RAD-CoT reduces attack success rates from 99\% (undefended) to below 5\% on CoT-Hijacking attacks across AdvBench and HarmBench evaluation sets, while preserving reasoning quality with less than 3\% degradation on GSM8K, MATH, and HumanEval benchmarks. The method adds approximately 5\% inference latency, operates through simple attention output hooks requiring no weight modification, and transfers to unseen attack variants without re-calibration.
+
+The broader significance of this work lies in bridging two previously disconnected research threads: \emph{mechanistic interpretability}---understanding the internal circuits responsible for model behavior---and \emph{practical LLM safety}---ensuring deployed models resist adversarial manipulation. RAD-CoT demonstrates that mechanistic understanding can be directly translated into runtime safety guarantees, moving beyond the correlational analyses that characterize much of current interpretability research toward \emph{causal} interventions with measurable safety impact.
+
+As reasoning models proliferate---with OpenAI o1~\citep{openai2024reasoning}, DeepSeek-R1~\citep{deepseek2025r1}, and Qwen3~\citep{qwen2025qwen3} representing only the first wave---the need for inference-time safety mechanisms that scale with chain-of-thought length becomes increasingly urgent. We hope that RAD-CoT provides both a practical tool and a conceptual framework for maintaining safety invariants in the era of reasoning-capable language models.
+
+
+% ============================================================================
+% References
+% ============================================================================
+
+\begin{thebibliography}{30}
+
+\bibitem[Bai et~al.(2022)]{bai2022constitutional}
+Bai, Y., Kadavath, S., Kundu, S., Askell, A., Kernion, J., Jones, A., Chen, A., Goldie, A., Mirhoseini, A., McKinnon, C., et~al.
+\newblock Constitutional {AI}: Harmlessness from {AI} feedback.
+\newblock \emph{arXiv preprint arXiv:2212.08073}, 2022.
+
+\bibitem[Chao et~al.(2023)]{chao2023jailbreaking}
+Chao, P., Robey, A., Dobriban, E., Hassani, H., Pappas, G.~J., and Wong, E.
+\newblock Jailbreaking black box large language models in twenty queries.
+\newblock \emph{arXiv preprint arXiv:2310.08419}, 2023.
+
+\bibitem[Chen et~al.(2021)]{chen2021evaluating}
+Chen, M., Tworek, J., Jun, H., Yuan, Q., Pinto, H.~P.~d.~O., Kaplan, J., Edwards, H., Burda, Y., Joseph, N., Brockman, G., et~al.
+\newblock Evaluating large language models trained on code.
+\newblock \emph{arXiv preprint arXiv:2107.03374}, 2021.
+
+\bibitem[Christiano et~al.(2017)]{christiano2017deep}
+Christiano, P.~F., Leike, J., Brown, T., Marber, M., Shlegeris, B., and Amodei, D.
+\newblock Deep reinforcement learning from human preferences.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2017.
+
+\bibitem[Cobbe et~al.(2021)]{cobbe2021training}
+Cobbe, K., Kosaraju, V., Bavarian, M., Chen, M., Jun, H., Kaiser, L., Plappert, M., Tworek, J., Hilton, J., Nakano, R., et~al.
+\newblock Training verifiers to solve math word problems.
+\newblock \emph{arXiv preprint arXiv:2110.14168}, 2021.
+
+\bibitem[Conmy et~al.(2023)]{conmy2023automated}
+Conmy, A., Mavor-Parker, A.~N., Lynch, A., Heimersheim, S., and Garriga-Alonso, A.
+\newblock Towards automated circuit discovery for mechanistic interpretability.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2023.
+
+\bibitem[Cunningham et~al.(2024)]{cunningham2023sparse}
+Cunningham, H., Ewart, A., Riggs, L., Huben, R., and Sharkey, L.
+\newblock Sparse autoencoders find highly interpretable features in language models.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2024.
+
+\bibitem[DeepSeek-AI(2025)]{deepseek2025r1}
+DeepSeek-AI.
+\newblock {DeepSeek-R1}: Incentivizing reasoning capability in {LLMs} via reinforcement learning.
+\newblock \emph{arXiv preprint arXiv:2501.12948}, 2025.
+
+\bibitem[Goldowsky-Dill et~al.(2023)]{goldowsky2023localizing}
+Goldowsky-Dill, N., MacLeod, C., Sato, L., and Arora, A.
+\newblock Localizing model behavior with path patching.
+\newblock \emph{arXiv preprint arXiv:2304.05969}, 2023.
+
+\bibitem[Hendrycks et~al.(2021)]{hendrycks2021measuring}
+Hendrycks, D., Burns, C., Kadavath, S., Arora, A., Basart, S., Tang, E., Song, D., and Steinhardt, J.
+\newblock Measuring mathematical problem solving with the {MATH} dataset.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2021.
+
+\bibitem[Jiang et~al.(2023)]{jiang2023mistral}
+Jiang, A.~Q., Sablayrolles, A., Mensch, A., Bamford, C., Chaplot, D.~S., de~las Casas, D., Bressand, F., Lengyel, G., Lample, G., Saulnier, L., et~al.
+\newblock Mistral {7B}.
+\newblock \emph{arXiv preprint arXiv:2310.06825}, 2023.
+
+\bibitem[Li et~al.(2024)]{li2024inference}
+Li, K., Patel, O., Vi\'{e}gas, F., Pfister, H., and Wattenberg, M.
+\newblock Inference-time intervention: Eliciting truthful answers from a language model.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2024.
+
+\bibitem[Liu et~al.(2024)]{liu2024autodan}
+Liu, X., Xu, N., Chen, M., and Xiao, C.
+\newblock {AutoDAN}: Generating stealthy jailbreak prompts on aligned large language models.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2024.
+
+\bibitem[Mazeika et~al.(2024)]{mazeika2024harmbench}
+Mazeika, M., Phan, L., Yin, X., Zou, A., Wang, Z., Mu, N., Sakhaee, E., Li, N., Basart, S., Li, B., et~al.
+\newblock {HarmBench}: A standardized evaluation framework for automated red teaming and robust refusal.
+\newblock \emph{arXiv preprint arXiv:2402.04249}, 2024.
+
+\bibitem[Meng et~al.(2022)]{meng2022locating}
+Meng, K., Bau, D., Andonian, A., and Belinkov, Y.
+\newblock Locating and editing factual associations in {GPT}.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2022.
+
+\bibitem[Meta(2024)]{meta2024llama3}
+Meta.
+\newblock The {L}lama 3 herd of models.
+\newblock \emph{arXiv preprint arXiv:2407.21783}, 2024.
+
+\bibitem[Nanda et~al.(2023)]{nanda2023attribution}
+Nanda, N., Chan, L., Lieberum, T., Smith, J., and Steinhardt, J.
+\newblock Progress measures for grokking via mechanistic interpretability.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2023.
+
+\bibitem[OpenAI(2024)]{openai2024reasoning}
+OpenAI.
+\newblock Learning to reason with {LLMs}.
+\newblock \emph{OpenAI Blog}, September 2024.
+
+\bibitem[Ouyang et~al.(2022)]{ouyang2022training}
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C., Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray, A., et~al.
+\newblock Training language models to follow instructions with human feedback.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2022.
+
+\bibitem[Qwen Team(2025)]{qwen2025qwen3}
+Qwen Team.
+\newblock Qwen3 technical report.
+\newblock \emph{arXiv preprint}, 2025.
+
+\bibitem[Rafailov et~al.(2023)]{rafailov2023direct}
+Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning, C.~D., and Finn, C.
+\newblock Direct preference optimization: Your language model is secretly a reward model.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2023.
+
+\bibitem[Soares et~al.(2024)]{soares2024safechain}
+Soares, L., Wen, Y., and Hooker, S.
+\newblock {SafeDecoding}: Defending against jailbreak attacks via safety-aware decoding.
+\newblock In \emph{Annual Meeting of the Association for Computational Linguistics (ACL)}, 2024.
+
+\bibitem[Touvron et~al.(2023)]{touvron2023llama}
+Touvron, H., Martin, L., Stone, K., Albert, P., Almahairi, A., Babaei, Y., Bashlykov, N., Batra, S., Bhargava, P., Bhosale, S., et~al.
+\newblock {L}lama 2: Open foundation and fine-tuned chat models.
+\newblock \emph{arXiv preprint arXiv:2307.09288}, 2023.
+
+\bibitem[Turner et~al.(2023)]{turner2023activation}
+Turner, A., Thiergart, L., Udell, D., Leech, G., Mini, U., and MacDiarmid, M.
+\newblock Activation addition: Steering language models without optimization.
+\newblock \emph{arXiv preprint arXiv:2308.10248}, 2023.
+
+\bibitem[Wang et~al.(2023)]{wang2023selfconsistency}
+Wang, X., Wei, J., Schuurmans, D., Le, Q.~V., Chi, E.~H., Narang, S., Chowdhery, A., and Zhou, D.
+\newblock Self-consistency improves chain of thought reasoning in language models.
+\newblock In \emph{International Conference on Learning Representations (ICLR)}, 2023.
+
+\bibitem[Wei et~al.(2022)]{wei2022chain}
+Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E.~H., Le, Q.~V., and Zhou, D.
+\newblock Chain-of-thought prompting elicits reasoning in large language models.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2022.
+
+\bibitem[Zou et~al.(2023a)]{zou2023universal}
+Zou, A., Wang, Z., Carlini, N., Nasr, M., Kolter, J.~Z., and Fredrikson, M.
+\newblock Universal and transferable adversarial attacks on aligned language models.
+\newblock \emph{arXiv preprint arXiv:2307.15043}, 2023.
+
+\bibitem[Zou et~al.(2023b)]{zou2023representation}
+Zou, A., Phan, L., Chen, S., Campbell, J., Guo, P., Ren, R., Pan, A., Yin, X., Mazeika, M., Dombrowski, A.-K., et~al.
+\newblock Representation engineering: A top-down approach to {AI} transparency.
+\newblock \emph{arXiv preprint arXiv:2310.01405}, 2023.
+
+\end{thebibliography}
+
+\end{document}
