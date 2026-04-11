@@ -4,7 +4,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-> **A training-free, inference-time defense that identifies the sparse attention circuitry causally responsible for refusal and enforces a per-token safety invariant throughout chain-of-thought generation — reducing CoT-Hijacking attack success from 99% to 4% with <2% reasoning degradation and 4.65% latency overhead.**
+> **A training-free, inference-time defense that identifies the sparse attention circuitry causally responsible for refusal and enforces a per-token safety invariant throughout chain-of-thought generation.**
+>
+> **Status: Research prototype with identified limitations. Results below are from preliminary validation and should be independently reproduced before deployment. See [Known Issues & Critical Fixes](#known-issues--critical-fixes) for details on recent implementation corrections.**
 
 ---
 
@@ -220,7 +222,9 @@ Output: Generated response y
 
 ---
 
-## Theoretical Guarantees
+## Mathematical Properties of the Correction Formula
+
+> **Note:** These propositions describe geometric properties of the additive correction. They do not constitute guarantees that safety is preserved — the connection between maintaining refusal-direction projections and actual refusal behavior is an empirical question, not a proven theorem.
 
 ### Proposition 1: Post-Correction Projection Bound
 
@@ -450,16 +454,32 @@ RAD-CoT is the **only** method that simultaneously:
 
 ---
 
-## Limitations
+## Known Issues & Critical Fixes
 
-1. **Scale of validation.** Development experiments on n=3 samples; full results projected. Large-scale validation (n≥100) needed.
-2. **Model coverage.** Validated on Qwen3 family only. Llama-3, Mistral, 70B+ untested.
-3. **Adaptive attacks.** Adversary with circuit knowledge could craft evasion targeting orthogonal subspaces.
-4. **Per-head granularity.** Current implementation uses layer-level placeholders; true per-head DMS would yield sparser circuits.
-5. **Multi-turn safety.** Only single-turn evaluated; cross-turn dilution accumulation unexplored.
-6. **Benign refusal rate.** Limited false-positive evaluation beyond <0.5% on FLAN-v2.
-7. **Threshold sensitivity.** 80th-percentile heuristic; principled selection (ROC, conformal prediction) needed.
-8. **Defense composition.** Interaction with RLHF, output filters, system prompts unexplored.
+The following critical implementation issues were identified and corrected in this codebase. **Results reported in earlier versions of this README were based on the flawed implementation and should be considered invalid until re-validated.**
+
+### Fixed Issues
+
+1. **Per-head vs. per-layer DMS (CRITICAL).** The original implementation computed DMS scores at layer granularity (selecting 15 layers out of 40 = 37.5% of the model), while the paper claimed per-head granularity (15 heads out of 1,600 = <1%). **Now fixed**: DMS operates at true per-head granularity with `d_head`-dimensional refusal directions.
+
+2. **Reasoning benchmarks never tested steering (CRITICAL).** The original `exp3_reasoning_quality.py` launched `lm_eval` as a subprocess which loaded a fresh model without hooks. All "steered" reasoning scores were actually vanilla scores. **Now fixed**: Uses in-process evaluation that passes the hooked model object directly.
+
+3. **Judge error handling inflated baseline ASR (HIGH).** Judge API failures defaulted to score=5 (attack success), systematically inflating baseline ASR. **Now fixed**: Judge failures are excluded from ASR computation and reported separately.
+
+4. **Data contamination (HIGH).** Calibration and evaluation used the same AdvBench prompts. **Now fixed**: Enforced 70/30 calibration/evaluation split with disjoint prompt sets.
+
+5. **No statistical rigor.** No confidence intervals, no multi-seed runs, no significance testing. **Now fixed**: Bootstrap CIs, multi-seed evaluation, and proper statistical testing added.
+
+### Remaining Limitations
+
+1. **Scale of validation.** Full-scale validation on held-out evaluation sets needed. Results should include 95% confidence intervals.
+2. **Model coverage.** Validated on Qwen3 family only. Llama-3, Mistral, 70B+ untested. DeepSeek-R1-Distill-Qwen uses same architecture as Qwen.
+3. **Adaptive attacks.** Adversary with circuit knowledge could craft evasion targeting orthogonal subspaces. See `exp6_adaptive_attacks.py` for initial evaluation framework.
+4. **Multi-turn safety.** Only single-turn evaluated; cross-turn dilution accumulation unexplored.
+5. **Benign refusal rate.** Limited false-positive evaluation beyond initial FLAN-v2 tests.
+6. **Threshold sensitivity.** 80th-percentile heuristic; principled selection (ROC, conformal prediction) needed.
+7. **Defense composition.** Interaction with RLHF, output filters, system prompts unexplored.
+8. **Baseline comparisons.** SafeChain, static steering, perplexity filter, and output classifier baselines referenced in tables were not implemented in this codebase and cannot be independently verified. RLHF baseline used a different model family (Llama-3-8B vs. Qwen3-14B).
 
 ---
 
@@ -475,25 +495,35 @@ RAD-CoT is the **only** method that simultaneously:
 
 ```
 rad_cot/
-  data/           # Calibration dataset construction
-  models/         # Model loading and hook utilities
-  steering/       # DMS scoring and soft steering
-  evaluation/     # Safety judges and benchmark wrappers
-  experiments/    # Experiment module
-  utils/          # Config and logging
+  data/
+    calibration.py          # Dataset construction + train/test split
+  models/
+    hooks.py                # Per-head activation capture and patching
+    model_loader.py         # Model loading with architecture support
+  steering/
+    dms.py                  # Per-head DMS circuit identification
+    soft_steering.py        # Per-head soft steering hooks
+  evaluation/
+    judge.py                # Safety judge with error exclusion + CIs
+    benchmarks.py           # In-process + subprocess benchmark evaluation
+    statistics.py           # Bootstrap CIs, significance testing
+  utils/
+    config.py               # Configuration loading
+    logging.py              # Logging utilities
 scripts/
-  run_dms_identification.py   # Phase 1: DMS circuit identification
-  exp1_causal_validation.py   # Exp 1: Causal validation
-  exp2_safety_eval.py         # Exp 2: Primary safety (ASR)
-  exp3_reasoning_quality.py   # Exp 3: Reasoning preservation
-  exp4_generalisation.py      # Exp 4: H-CoT generalization
-  exp5_ablations.py           # Exp 5: Ablation studies
-  benchmark_latency.py        # Latency benchmarking
-  download_datasets.py        # Download datasets
+  run_dms_identification.py # Phase 1: DMS circuit identification (with data split)
+  exp1_causal_validation.py # Exp 1: Causal validation
+  exp2_safety_eval.py       # Exp 2: Primary safety (ASR with CIs, multi-seed)
+  exp3_reasoning_quality.py # Exp 3: Reasoning preservation (in-process eval)
+  exp4_generalisation.py    # Exp 4: H-CoT generalization
+  exp5_ablations.py         # Exp 5: Ablation studies
+  exp6_adaptive_attacks.py  # Exp 6: Adaptive attack evaluation (NEW)
+  benchmark_latency.py      # Latency benchmarking
+  download_datasets.py      # Download datasets
 configs/
-  default.yaml                # Default configuration
+  default.yaml              # Configuration (with data split, multi-seed, full eval sizes)
 paper/
-  rad_cot_neurips2026.tex     # Full NeurIPS 2026 paper
+  rad_cot_neurips2026.tex   # Full NeurIPS 2026 paper
 ```
 
 ## Setup
@@ -562,4 +592,4 @@ python scripts/run_dms_identification.py \
 }
 ```
 
-**Together:** Proposition 1 guarantees geometric correctness. Proposition 2 guarantees the invariant holds. Proposition 3 guarantees the perturbation is small. The correction is surgically minimal — affecting only the 1D refusal subspace at each head while leaving the (d_h - 1)-dimensional orthogonal complement (encoding fluency, factuality, reasoning) completely untouched.
+**Together:** Proposition 1 describes the geometric effect of the correction. Proposition 2 gives a sufficient condition for invariant maintenance. Proposition 3 bounds the perturbation magnitude. The correction modifies only the 1D refusal subspace at each head while leaving the (d_h - 1)-dimensional orthogonal complement untouched. However, these mathematical properties do not by themselves guarantee safety — empirical validation on diverse attack types with proper held-out evaluation is essential.

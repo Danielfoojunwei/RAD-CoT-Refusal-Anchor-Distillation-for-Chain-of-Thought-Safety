@@ -27,7 +27,7 @@ import torch
 from tqdm import tqdm
 
 from rad_cot.data.calibration import generate_cot_hijacking_padding
-from rad_cot.evaluation.judge import compute_asr, evaluate_batch
+from rad_cot.evaluation.judge import compute_asr, compute_asr_with_ci, evaluate_batch
 from rad_cot.models.model_loader import load_model_and_tokenizer
 from rad_cot.steering.dms import DMSResult, select_circuit
 from rad_cot.steering.soft_steering import generate_with_steering
@@ -55,9 +55,15 @@ def evaluate_condition(
         resp, _ = generate_with_steering(model, tokenizer, prompt, dms_result, alpha=alpha)
         responses.append(resp)
 
-    judge_results = evaluate_batch(prompts, responses, judge_model)
-    asr = compute_asr(judge_results)
-    return {"asr": asr, "n": len(prompts)}
+    batch_results = evaluate_batch(prompts, responses, judge_model)
+    asr, ci_lower, ci_upper = compute_asr_with_ci(batch_results)
+    return {
+        "asr": asr,
+        "asr_ci_lower": ci_lower,
+        "asr_ci_upper": ci_upper,
+        "n_valid": len(batch_results.valid_results),
+        "n_judge_errors": batch_results.n_errors,
+    }
 
 
 def generate_vanilla_responses(model, tokenizer, prompts) -> list[str]:

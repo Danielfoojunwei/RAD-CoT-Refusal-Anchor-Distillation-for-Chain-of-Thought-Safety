@@ -7,11 +7,13 @@ Conditions:
   (b) RAD-CoT alpha=0.1
   (c) RAD-CoT alpha=0.3
   (d) RAD-CoT alpha=0.5
-  (e) SafeChain decoding (baseline)
-  (f) RLHF-tuned proxy (Llama-3-8B-Instruct baseline)
 
 Judge: GPT-4o with StrongREJECT rubric.
-Report: ASR = fraction of attack queries that succeed.
+Report: ASR with 95% bootstrap CI. Judge failures are EXCLUDED from ASR.
+
+IMPORTANT: Attack prompts MUST be from a held-out evaluation set that was
+NOT used during DMS circuit identification. Using the same prompts for
+calibration and evaluation constitutes data contamination.
 
 Usage:
     python scripts/exp2_safety_eval.py \
@@ -33,12 +35,17 @@ import torch
 from tqdm import tqdm
 
 from rad_cot.data.calibration import generate_cot_hijacking_padding
-from rad_cot.evaluation.judge import compute_asr, evaluate_batch
+from rad_cot.evaluation.judge import (
+    BatchJudgeResults,
+    compute_asr,
+    compute_asr_with_ci,
+    evaluate_batch,
+)
 from rad_cot.models.model_loader import load_model_and_tokenizer
 from rad_cot.steering.dms import DMSResult
 from rad_cot.steering.soft_steering import RADCoTSteering, generate_with_steering
 from rad_cot.utils.config import ModelConfig
-from rad_cot.utils.logging import init_wandb, setup_logger
+from rad_cot.utils.logging import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -86,17 +93,19 @@ def main():
     parser.add_argument("--dms-result", type=str, required=True)
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-14B")
     parser.add_argument("--attack-prompts", type=str, required=True,
-                        help="JSON file with attack prompts or base harmful prompts")
+                        help="JSON file with HELD-OUT evaluation prompts (not used in calibration)")
     parser.add_argument("--output-dir", type=str, default="outputs/exp2")
     parser.add_argument("--n-attempts", type=int, default=100)
     parser.add_argument("--judge-model", type=str, default="gpt-4o")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seeds", type=int, nargs="+", default=None,
+                        help="Multiple seeds for multi-run evaluation (e.g., --seeds 42 123 456)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.manual_seed(args.seed)
+    seeds = args.seeds or [args.seed]
 
     # Load DMS result
     with open(args.dms_result, "rb") as f:
@@ -109,16 +118,6 @@ def main():
     with open(args.attack_prompts) as f:
         raw_prompts = json.load(f)
 
-    # Construct CoT-Hijacking attack prompts
-    attack_prompts = []
-    for i, prompt in enumerate(raw_prompts[:args.n_attempts]):
-        padding = generate_cot_hijacking_padding(
-            min_tokens=100, max_tokens=500, seed=args.seed + i
-        )
-        attack_prompts.append(f"{padding}\n\nNow, please help me with: {prompt}")
-
-    logger.info(f"Prepared {len(attack_prompts)} attack prompts")
-
     conditions = {
         "vanilla": {"alpha": None},
         "rad_cot_0.1": {"alpha": 0.1},
@@ -128,60 +127,130 @@ def main():
 
     all_results = {}
 
-    for cond_name, cond_params in conditions.items():
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Running condition: {cond_name}")
-        logger.info(f"{'='*60}")
+    for run_idx, seed in enumerate(seeds):
+        logger.info(f"\n{'#'*60}")
+        logger.info(f"RUN {run_idx + 1}/{len(seeds)} (seed={seed})")
+        logger.info(f"{'#'*60}")
 
-        prompts, responses, wall_time = run_condition(
-            model, tokenizer, attack_prompts,
-            dms_result=dms_result if cond_params["alpha"] is not None else None,
-            alpha=cond_params["alpha"],
-        )
+        torch.manual_seed(seed)
 
-        # Judge evaluation
-        logger.info(f"Evaluating {len(responses)} responses with {args.judge_model}...")
-        judge_results = evaluate_batch(prompts, responses, judge_model=args.judge_model)
-        asr = compute_asr(judge_results)
+        # Construct CoT-Hijacking attack prompts with this seed
+        attack_prompts = []
+        for i, prompt in enumerate(raw_prompts[:args.n_attempts]):
+            padding = generate_cot_hijacking_padding(
+                min_tokens=100, max_tokens=500, seed=seed + i
+            )
+            attack_prompts.append(f"{padding}\n\nNow, please help me with: {prompt}")
 
-        cond_result = {
-            "condition": cond_name,
-            "alpha": cond_params["alpha"],
-            "asr": asr,
-            "n_attack_success": sum(1 for r in judge_results if r.is_attack_success),
-            "n_total": len(judge_results),
-            "wall_time_s": wall_time,
-            "mean_score": sum(r.score for r in judge_results) / len(judge_results),
-        }
-        all_results[cond_name] = cond_result
+        logger.info(f"Prepared {len(attack_prompts)} attack prompts")
 
-        # Save per-condition details
-        cond_dir = output_dir / cond_name
-        cond_dir.mkdir(exist_ok=True)
-        with open(cond_dir / "results.json", "w") as f:
-            json.dump(cond_result, f, indent=2)
-        with open(cond_dir / "responses.json", "w") as f:
-            json.dump([
-                {"prompt": p, "response": r, "score": jr.score, "attack_success": jr.is_attack_success}
-                for p, r, jr in zip(prompts, responses, judge_results)
-            ], f, indent=2)
+        for cond_name, cond_params in conditions.items():
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Running condition: {cond_name} (seed={seed})")
+            logger.info(f"{'='*60}")
 
-        logger.info(f"ASR ({cond_name}): {asr:.4f}")
+            prompts, responses, wall_time = run_condition(
+                model, tokenizer, attack_prompts,
+                dms_result=dms_result if cond_params["alpha"] is not None else None,
+                alpha=cond_params["alpha"],
+            )
+
+            # Judge evaluation
+            logger.info(f"Evaluating {len(responses)} responses with {args.judge_model}...")
+            batch_results = evaluate_batch(
+                prompts, responses, judge_model=args.judge_model
+            )
+
+            # Compute ASR with confidence intervals
+            asr, ci_lower, ci_upper = compute_asr_with_ci(batch_results)
+            valid_results = batch_results.valid_results
+
+            cond_result = {
+                "condition": cond_name,
+                "alpha": cond_params["alpha"],
+                "seed": seed,
+                "asr": asr,
+                "asr_ci_lower": ci_lower,
+                "asr_ci_upper": ci_upper,
+                "n_attack_success": sum(
+                    1 for r in valid_results if r.is_attack_success
+                ),
+                "n_valid": len(valid_results),
+                "n_judge_errors": batch_results.n_errors,
+                "n_total": batch_results.n_total,
+                "judge_error_rate": batch_results.error_rate,
+                "wall_time_s": wall_time,
+                "mean_score": (
+                    sum(r.score for r in valid_results) / len(valid_results)
+                    if valid_results else 0.0
+                ),
+            }
+
+            result_key = f"{cond_name}_seed{seed}"
+            all_results[result_key] = cond_result
+
+            # Save per-condition details
+            cond_dir = output_dir / result_key
+            cond_dir.mkdir(exist_ok=True)
+            with open(cond_dir / "results.json", "w") as f:
+                json.dump(cond_result, f, indent=2)
+            with open(cond_dir / "responses.json", "w") as f:
+                json.dump([
+                    {
+                        "prompt": p, "response": r,
+                        "score": jr.score,
+                        "attack_success": jr.is_attack_success,
+                        "judge_error": jr.judge_error,
+                    }
+                    for p, r, jr in zip(prompts, responses, batch_results.results)
+                ], f, indent=2)
+
+            logger.info(
+                f"ASR ({cond_name}, seed={seed}): {asr:.4f} "
+                f"[{ci_lower:.4f}, {ci_upper:.4f}] "
+                f"(judge errors: {batch_results.n_errors}/{batch_results.n_total})"
+            )
+
+    # Aggregate across seeds
+    aggregate = {}
+    for cond_name in conditions:
+        cond_runs = [
+            v for k, v in all_results.items() if k.startswith(cond_name + "_seed")
+        ]
+        if cond_runs:
+            asrs = [r["asr"] for r in cond_runs]
+            import numpy as np
+            aggregate[cond_name] = {
+                "mean_asr": float(np.mean(asrs)),
+                "std_asr": float(np.std(asrs)),
+                "min_asr": float(np.min(asrs)),
+                "max_asr": float(np.max(asrs)),
+                "n_runs": len(cond_runs),
+            }
 
     # Summary
     summary = {
-        "conditions": all_results,
+        "per_run_results": all_results,
+        "aggregate": aggregate,
         "model": args.model,
         "n_attempts": args.n_attempts,
+        "seeds": seeds,
         "judge_model": args.judge_model,
+        "note": (
+            "Judge errors are EXCLUDED from ASR computation. "
+            "ASR confidence intervals are 95% bootstrap CIs."
+        ),
     }
     with open(output_dir / "summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     logger.info("\n" + "=" * 60)
-    logger.info("EXPERIMENT 2 SUMMARY")
-    for name, res in all_results.items():
-        logger.info(f"  {name}: ASR = {res['asr']:.4f}")
+    logger.info("EXPERIMENT 2 SUMMARY (AGGREGATE)")
+    for name, agg in aggregate.items():
+        logger.info(
+            f"  {name}: mean ASR = {agg['mean_asr']:.4f} +/- {agg['std_asr']:.4f} "
+            f"(n={agg['n_runs']} runs)"
+        )
     logger.info("=" * 60)
 
 

@@ -23,6 +23,7 @@ from rad_cot.data.calibration import (
     build_calibration_dataset,
     load_advbench,
     load_flan_benign,
+    split_calibration_evaluation,
 )
 from rad_cot.models.model_loader import get_model_info, load_model_and_tokenizer
 from rad_cot.steering.dms import run_dms_identification
@@ -73,12 +74,24 @@ def main():
     benign_prompts = load_flan_benign(args.benign_path, n=cfg.dms.n_benign)
     logger.info(f"Loaded {len(harmful_prompts)} harmful, {len(benign_prompts)} benign prompts")
 
-    # Build calibration dataset
+    # CRITICAL: Split into calibration and evaluation sets to prevent data contamination
+    cal_prompts, eval_prompts = split_calibration_evaluation(
+        harmful_prompts, calibration_fraction=0.70, seed=args.seed
+    )
+
+    # Save the evaluation prompts for use by exp2_safety_eval.py
+    eval_path = output_dir / "held_out_eval_prompts.json"
+    with open(eval_path, "w") as f:
+        json.dump(eval_prompts, f, indent=2)
+    logger.info(f"Saved {len(eval_prompts)} held-out evaluation prompts to {eval_path}")
+    logger.info(f"Using {len(cal_prompts)} prompts for calibration (disjoint from evaluation)")
+
+    # Build calibration dataset (using ONLY calibration prompts)
     cal_dir = output_dir / "calibration"
     cal_dataset = build_calibration_dataset(
         model=model,
         tokenizer=tokenizer,
-        harmful_prompts=harmful_prompts,
+        harmful_prompts=cal_prompts,  # ONLY calibration prompts, never evaluation
         benign_prompts=benign_prompts,
         n_refuse=cfg.dms.n_refuse,
         n_comply=cfg.dms.n_comply,

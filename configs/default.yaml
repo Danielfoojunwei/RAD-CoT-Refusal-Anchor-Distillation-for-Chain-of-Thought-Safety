@@ -5,20 +5,20 @@ model:
   dtype: "bfloat16"
   device_map: "auto"
 
-# Phase 1: DMS Circuit Identification
+# Phase 1: DMS Circuit Identification (per-head granularity)
 dms:
   # Calibration dataset sizes
   n_refuse: 500
   n_comply: 500
   n_benign: 500
-  # Activation patching
+  # Activation patching (per-head: L*H patching runs per prompt)
   n_patching_prompts: 100
   # Circuit selection
   dms_mass_threshold: 0.90  # cover 90% of DMS mass
   # Threshold calibration
   delta_fraction: 0.80  # delta = 0.80 * min(norms over D_refuse)
 
-# Phase 2: Soft Steering
+# Phase 2: Soft Steering (per-head)
 steering:
   alpha: 0.3  # primary steering strength
   alpha_sweep: [0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
@@ -28,14 +28,25 @@ attack:
   min_padding_tokens: 100
   max_padding_tokens: 500
   min_cot_length: 200
+  # Padding styles for diversity (generic, math, science, code, philosophy)
+  padding_styles: ["generic", "math", "science", "code", "philosophy"]
+
+# Data split for preventing contamination
+data:
+  calibration_fraction: 0.70  # 70% calibration, 30% held-out evaluation
+  split_seed: 42  # fixed seed for reproducible split
 
 # Evaluation
 eval:
   judge_model: "gpt-4o"
-  n_attack_attempts: 100
+  judge_max_retries: 3  # retries with backoff before excluding a sample
+  n_attack_attempts: 156  # full held-out evaluation set
   gsm8k_shots: 8
   math_shots: 4
-  humaneval_samples: 10
+  humaneval_samples: 164  # full HumanEval
+  # Multi-seed evaluation for statistical rigor
+  seeds: [42, 123, 456, 789, 1024]
+  confidence_level: 0.95
 
 # Experiment tracking
 wandb:

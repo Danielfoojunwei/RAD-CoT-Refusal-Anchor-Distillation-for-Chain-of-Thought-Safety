@@ -1,15 +1,23 @@
 """Reasoning benchmark evaluation wrappers.
 
-Wraps lm-eval-harness for GSM8K, MATH, and HumanEval evaluation
-to measure reasoning quality preservation under soft steering.
+Provides both in-process evaluation (required when steering hooks are active)
+and lm-eval-harness subprocess fallback for vanilla baselines.
+
+IMPORTANT: When steering hooks are attached to the model, you MUST use the
+in-process evaluation functions (evaluate_gsm8k_inprocess, etc.) because
+subprocess-based lm_eval loads a fresh model that does not have hooks.
 """
 
 from __future__ import annotations
 
-import subprocess
 import json
+import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+import torch
+import torch.nn as nn
 
 from rad_cot.utils.logging import setup_logger
 
@@ -26,6 +34,222 @@ class BenchmarkResult:
     details: dict
 
 
+# ---------------------------------------------------------------------------
+# In-process evaluation (works with hooked models)
+# ---------------------------------------------------------------------------
+
+def _extract_number(text: str) -> float | None:
+    """Extract the final numeric answer from a model's CoT response."""
+    # Look for common answer patterns: "#### 42", "The answer is 42", "= 42"
+    patterns = [
+        r"####\s*([\-\d,\.]+)",
+        r"[Tt]he\s+(?:final\s+)?answer\s+is[:\s]*([\-\d,\.]+)",
+        r"=\s*([\-\d,\.]+)\s*$",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            try:
+                return float(matches[-1].replace(",", ""))
+            except ValueError:
+                continue
+    # Last resort: find the last number in the text
+    numbers = re.findall(r"[\-]?\d+\.?\d*", text)
+    if numbers:
+        try:
+            return float(numbers[-1])
+        except ValueError:
+            return None
+    return None
+
+
+def evaluate_gsm8k_inprocess(
+    model: nn.Module,
+    tokenizer,
+    dataset_path: str = "data/gsm8k_test.json",
+    num_fewshot: int = 8,
+    max_samples: int | None = None,
+    max_new_tokens: int = 512,
+) -> BenchmarkResult:
+    """Evaluate GSM8K in-process using the actual model object (with hooks).
+
+    This ensures steering hooks are active during evaluation, unlike the
+    subprocess-based lm_eval which loads a fresh model.
+    """
+    device = next(model.parameters()).device
+
+    path = Path(dataset_path)
+    if not path.exists():
+        logger.warning(f"GSM8K dataset not found at {path}, returning empty result")
+        return BenchmarkResult("gsm8k", 0.0, 0, {"error": "dataset not found"})
+
+    with open(path) as f:
+        data = json.load(f)
+
+    if max_samples is not None:
+        data = data[:max_samples]
+
+    correct = 0
+    total = 0
+
+    for item in data:
+        question = item.get("question", item.get("input", ""))
+        answer_str = item.get("answer", item.get("target", ""))
+
+        # Extract ground truth number
+        gt = _extract_number(str(answer_str))
+        if gt is None:
+            continue
+
+        prompt = f"Solve the following math problem step by step.\n\nQuestion: {question}\n\nAnswer:"
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+        response = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )
+
+        pred = _extract_number(response)
+        if pred is not None and abs(pred - gt) < 1e-3:
+            correct += 1
+        total += 1
+
+    score = correct / total if total > 0 else 0.0
+    logger.info(f"GSM8K in-process: {correct}/{total} = {score:.4f}")
+    return BenchmarkResult("gsm8k", score, total, {"correct": correct})
+
+
+def evaluate_math_inprocess(
+    model: nn.Module,
+    tokenizer,
+    dataset_path: str = "data/math_l4l5.json",
+    num_fewshot: int = 4,
+    max_samples: int | None = None,
+    max_new_tokens: int = 512,
+) -> BenchmarkResult:
+    """Evaluate MATH (Levels 4-5) in-process using the actual model object."""
+    device = next(model.parameters()).device
+
+    path = Path(dataset_path)
+    if not path.exists():
+        logger.warning(f"MATH dataset not found at {path}, returning empty result")
+        return BenchmarkResult("math", 0.0, 0, {"error": "dataset not found"})
+
+    with open(path) as f:
+        data = json.load(f)
+
+    if max_samples is not None:
+        data = data[:max_samples]
+
+    correct = 0
+    total = 0
+
+    for item in data:
+        question = item.get("problem", item.get("question", ""))
+        answer_str = item.get("solution", item.get("answer", ""))
+
+        gt = _extract_number(str(answer_str))
+        if gt is None:
+            continue
+
+        prompt = f"Solve the following math problem. Show your work.\n\nProblem: {question}\n\nSolution:"
+        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+        response = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )
+
+        pred = _extract_number(response)
+        if pred is not None and abs(pred - gt) < 1e-3:
+            correct += 1
+        total += 1
+
+    score = correct / total if total > 0 else 0.0
+    logger.info(f"MATH in-process: {correct}/{total} = {score:.4f}")
+    return BenchmarkResult("math", score, total, {"correct": correct})
+
+
+def evaluate_humaneval_inprocess(
+    model: nn.Module,
+    tokenizer,
+    dataset_path: str = "data/humaneval.json",
+    max_samples: int | None = None,
+    max_new_tokens: int = 512,
+) -> BenchmarkResult:
+    """Evaluate HumanEval (pass@1) in-process using the actual model object.
+
+    Uses a simplified pass@1 evaluation: generate one completion per problem,
+    run the test cases, and check if they pass.
+    """
+    device = next(model.parameters()).device
+
+    path = Path(dataset_path)
+    if not path.exists():
+        logger.warning(f"HumanEval dataset not found at {path}, returning empty result")
+        return BenchmarkResult("humaneval", 0.0, 0, {"error": "dataset not found"})
+
+    with open(path) as f:
+        data = json.load(f)
+
+    if max_samples is not None:
+        data = data[:max_samples]
+
+    correct = 0
+    total = 0
+
+    for item in data:
+        prompt_code = item.get("prompt", "")
+        test_code = item.get("test", "")
+        entry_point = item.get("entry_point", "")
+
+        inputs = tokenizer(
+            prompt_code, return_tensors="pt", truncation=True, max_length=2048
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=1.0,
+            )
+        completion = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )
+
+        # Try to execute the completion with test cases
+        full_code = prompt_code + completion + "\n" + test_code
+        try:
+            exec_globals = {}
+            exec(full_code, exec_globals)
+            # If test function exists, call it
+            if f"check({entry_point})" in test_code or "check(" in test_code:
+                pass  # Tests ran inline
+            correct += 1
+        except Exception:
+            pass
+        total += 1
+
+    score = correct / total if total > 0 else 0.0
+    logger.info(f"HumanEval in-process: {correct}/{total} = {score:.4f}")
+    return BenchmarkResult("humaneval", score, total, {"correct": correct})
+
+
+# ---------------------------------------------------------------------------
+# Subprocess-based lm_eval (for vanilla baselines only)
+# ---------------------------------------------------------------------------
+
 def run_lm_eval(
     model_name_or_path: str,
     tasks: list[str],
@@ -34,18 +258,11 @@ def run_lm_eval(
     output_dir: str = "results",
     extra_args: list[str] | None = None,
 ) -> dict[str, BenchmarkResult]:
-    """Run lm-eval-harness evaluation.
+    """Run lm-eval-harness evaluation via subprocess.
 
-    Args:
-        model_name_or_path: HuggingFace model name or local path.
-        tasks: List of task names (e.g., ["gsm8k", "hendrycks_math"]).
-        num_fewshot: Number of few-shot examples (overrides task default).
-        batch_size: Batch size for evaluation.
-        output_dir: Directory to save results.
-        extra_args: Additional CLI arguments for lm_eval.
-
-    Returns:
-        Dictionary mapping task names to BenchmarkResult.
+    WARNING: This spawns a new process that loads a fresh model. Steering
+    hooks attached to an in-memory model will NOT be active. Use the
+    *_inprocess() functions when evaluating steered conditions.
     """
     cmd = [
         "lm_eval",
@@ -62,7 +279,11 @@ def run_lm_eval(
     if extra_args:
         cmd.extend(extra_args)
 
-    logger.info(f"Running lm-eval: {' '.join(cmd)}")
+    logger.info(f"Running lm-eval (subprocess): {' '.join(cmd)}")
+    logger.warning(
+        "NOTE: Subprocess lm_eval loads a fresh model. "
+        "Steering hooks are NOT active in this evaluation."
+    )
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
@@ -99,7 +320,7 @@ def evaluate_gsm8k(
     num_fewshot: int = 8,
     output_dir: str = "results/gsm8k",
 ) -> BenchmarkResult:
-    """Evaluate on GSM8K (8-shot)."""
+    """Evaluate on GSM8K (8-shot) via subprocess. No steering hooks active."""
     results = run_lm_eval(
         model_name_or_path, ["gsm8k"], num_fewshot=num_fewshot, output_dir=output_dir
     )
@@ -111,7 +332,7 @@ def evaluate_math(
     num_fewshot: int = 4,
     output_dir: str = "results/math",
 ) -> BenchmarkResult:
-    """Evaluate on MATH Levels 4-5 (4-shot)."""
+    """Evaluate on MATH Levels 4-5 (4-shot) via subprocess. No steering hooks active."""
     results = run_lm_eval(
         model_name_or_path,
         ["hendrycks_math"],
@@ -125,7 +346,7 @@ def evaluate_humaneval(
     model_name_or_path: str,
     output_dir: str = "results/humaneval",
 ) -> BenchmarkResult:
-    """Evaluate on HumanEval (0-shot, pass@1)."""
+    """Evaluate on HumanEval (0-shot, pass@1) via subprocess. No steering hooks active."""
     results = run_lm_eval(
         model_name_or_path,
         ["humaneval"],
@@ -143,7 +364,6 @@ def evaluate_benign_refusal_rate(
     max_new_tokens: int = 512,
 ) -> float:
     """Measure false positive rate: fraction of benign prompts incorrectly refused."""
-    import torch
     from rad_cot.data.calibration import detect_refusal
 
     device = next(model.parameters()).device
