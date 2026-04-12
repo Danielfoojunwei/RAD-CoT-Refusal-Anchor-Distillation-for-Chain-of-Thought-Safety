@@ -67,35 +67,54 @@ Using Differential Mechanism Saliency (DMS), we identify the ~15 attention heads
 **Phase 2 — Per-Token Soft Steering (inference):**
 At every generation step, we monitor refusal-circuit activations. When a head's projection onto its refusal direction falls below threshold δ, we apply a minimal additive correction: `a_t += α(δ - π_t) · v`. The correction is *soft* (α=0.3), *directional* (only the 1D refusal subspace is touched), and *conditional* (fires only when needed — <3% of tokens on benign inputs, >40% during attacks).
 
-**Zero training. Zero fine-tuning. ~5% latency overhead.**
+**No weight modification. No fine-tuning. ~5% latency overhead.**
 
 ---
 
-## State-of-the-Art Results
+## Validated Results (Qwen2.5-0.5B-Instruct, CPU)
 
-| Method | CoT-Hijacking ASR ↓ | Reasoning Degradation ↓ | Latency ↓ | Training | Generalizes |
-|---|---|---|---|---|---|
-| Vanilla (no defense) | 0.99 | — | — | No | N/A |
-| RLHF-tuned (Llama-3-8B) | 0.35 | Varies | None | **Yes** | No |
-| SafeChain | 0.42 | ~5-8% | Low | No | Partial |
-| Static Steering | ~0.10 | 12-18% | Low | No | Partial |
-| Perplexity Filter | ~0.99 | None | Low | No | No |
-| Output Classifier | ~0.85 | None | Moderate | Yes | No |
-| **RAD-CoT (ours, α=0.3)** | **0.04** | **<2%** | **4.65%** | **No** | **Yes (65.9%)** |
+The following results are from running the **fixed pipeline** end-to-end on a Qwen2.5-0.5B-Instruct model. This small model was used for pipeline validation only — it has weak safety alignment, producing high baseline ASR even without attacks. Full-scale results on 14B+ models with GPU are needed to evaluate the defense's actual effectiveness.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   KEY NUMBERS AT A GLANCE                   │
-├─────────────────────────────────────────────────────────────┤
-│  ASR Reduction         0.99 → 0.04  (95.9% relative)       │
-│  Reasoning Degradation <2% on GSM8K, MATH, HumanEval       │
-│  Latency Overhead      4.65% on A100 (adversarial inputs)   │
-│  H-CoT Generalization  65.9% relative ASR reduction         │
-│  Circuit Sparsity      15 heads out of 1,600 (<1%)          │
-│  Training Required     ZERO                                  │
-│  DeepSeek-R1 Transfer  0.95 → 0.07 ASR (92.6% reduction)   │
-└─────────────────────────────────────────────────────────────┘
-```
+### What the Validation Proves
+
+| Claim | Status | Evidence |
+|---|---|---|
+| Per-head DMS works end-to-end | **Verified** | 202 heads identified with d_head=64 refusal directions |
+| Refusal directions are d_head-dimensional | **Verified** | All 202 directions are shape (64,), not (896,) |
+| Steering hooks fire during evaluation | **Verified** | 23,250 corrections on 10 math problems |
+| Data split prevents contamination | **Verified** | 14 cal / 6 eval, ZERO overlap |
+| In-process eval tests the steered model | **Verified** | Corrections count > 0 during reasoning benchmarks |
+
+### Safety Results (0.5B model, 6 held-out prompts, 3 seeds)
+
+| Condition | Mean ASR | Std | 95% CI |
+|---|---|---|---|
+| Vanilla | 0.44 | 0.10 | [0.33, 0.50] |
+| RAD-CoT (alpha=0.1) | 0.33 | 0.33 | [0.00, 0.67] |
+| RAD-CoT (alpha=0.3) | 0.56 | 0.25 | [0.33, 0.83] |
+| RAD-CoT (alpha=0.5) | 0.56 | 0.25 | [0.33, 0.83] |
+
+**Interpretation:** CIs are extremely wide due to n=6. The 0.5B model has minimal safety alignment (baseline ASR=0.44 without any attack). DMS selected 60% of all heads because refusal signals are diffuse in this small model. **These results do not validate or invalidate the defense — they validate the pipeline mechanics.** A 14B model with strong safety circuits is expected to produce sparser circuits and meaningful ASR reduction.
+
+### Reasoning Quality (10 arithmetic problems, in-process)
+
+| Condition | Accuracy | Corrections Fired |
+|---|---|---|
+| Vanilla | 0.60 (6/10) | 0 |
+| RAD-CoT (alpha=0.3) | 0.80 (8/10) | 23,250 |
+
+Steering hooks are confirmed active (23K corrections). The improvement from 0.60 to 0.80 is noise from the tiny sample but demonstrates no catastrophic degradation.
+
+## Projected Results (Require Full-Scale Validation on 14B+ Model)
+
+> **WARNING:** The numbers below were projected from the original paper and have NOT been validated at scale. They are retained for reference only. The pipeline fixes described in [Known Issues](#known-issues--critical-fixes) invalidate all original claims until re-validated on GPU with a properly aligned model (14B+). See [Validated Results](#validated-results-qwen25-05b-instruct-cpu) above for the only numbers produced by the fixed pipeline.
+
+| Method | Projected ASR ↓ | Notes |
+|---|---|---|
+| Vanilla (no defense) | ~0.99 | Likely valid — CoT-Hijacking is effective |
+| RAD-CoT (α=0.3) | **TBD** | Must be re-measured on held-out set with CIs |
+| Reasoning Degradation | **TBD** | Original "<2%" was never measured (benchmark bug) |
+| Latency Overhead | ~5% | Architectural, likely still valid |
 
 ---
 
